@@ -367,6 +367,517 @@ elif cmd == "layout":
         print("accepted")
     except wire.InputError:
         print("refused")
+elif cmd == "chacha20":
+    print(wire.chacha20_block(bytes(range(32)), 1, bytes.fromhex("000000090000004a00000000")).hex())
+elif cmd in ("netlink", "rawwatch"):
+    # Decoder fault injections, not kernel replies seen in normal runs: the
+    # helper's own netlink decoder (udp_sockets, DeliveryWatch.destroyed) on
+    # raw datagrams scripted here, through a stand-in for the kernel's
+    # sock_diag socket.
+    #   netlink <case>: one dump or one notification batch; prints what the
+    #     decoder made of it, or "refused: <reason>".
+    #   rawwatch <case>: a whole record on scripted frames and clocks, its
+    #     delivery watch on raw replies with one fault, then auto-expect on
+    #     that record: the verdict line.
+    import base64, contextlib, errno, io, socket
+    case = sys.argv[3]
+    SECOND = 10 ** 9
+    MULTI, INTR = wire.NLM_F_MULTI, wire.NLM_F_DUMP_INTR
+
+    def nlmsg(kind, payload=b"", flags=0, seq=1):
+        return struct.pack("=IHHII", 16 + len(payload), kind, flags, seq, 0) + payload + bytes(-len(payload) % 4)
+
+    def status(code):
+        return struct.pack("=i", code)
+
+    def diag(family, sport, cookie=1, drops=0, attribute=True):
+        message = (bytes([family, 7, 0, 0]) + struct.pack(">HH", sport, 0) + bytes(32) + struct.pack("=III", 0, cookie, 0)
+                   + bytes(20))
+        if attribute:
+            message += struct.pack("=HH", 40, wire.INET_DIAG_SKMEMINFO) + struct.pack("=9I", *([0] * 8 + [drops]))
+        return message
+
+    LISTENER = nlmsg(20, diag(socket.AF_INET, 51998), MULTI)
+    DONE = nlmsg(3, status(0), MULTI)
+    real_socket = socket.socket
+    dumps = []  # one list of datagrams per dump, consumed in order; default: complete
+
+    class Link:
+        """A sock_diag socket: a dump's replies, then nothing."""
+
+        def __init__(self, *args):
+            self.replies = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def send(self, data):
+            family = data[16]
+            default = [LISTENER + DONE] if family == socket.AF_INET else [DONE]
+            self.replies = list(dumps.pop(0) or default) if dumps else default
+
+        def recv(self, size):
+            return self.replies.pop(0) if self.replies else b""
+
+    def netlink_socket(family, *args):
+        return Link() if family == socket.AF_NETLINK else real_socket(family, *args)
+
+    class Events:
+        """The notification socket: queued datagrams, then EAGAIN."""
+
+        def __init__(self):
+            self.queue = []
+
+        def recv(self, size):
+            if not self.queue:
+                raise BlockingIOError()
+            return self.queue.pop(0)
+
+    wire.socket.socket = netlink_socket
+    if cmd == "netlink":
+        cases = {
+            "dump-empty": [DONE],
+            "dump-listener": [LISTENER + DONE],
+            "dump-two-datagrams": [LISTENER, DONE],
+            "dump-interrupted": [nlmsg(3, status(0), MULTI | INTR)],
+            "dump-interrupted-socket": [nlmsg(20, diag(socket.AF_INET, 51998), MULTI | INTR) + DONE],
+            "dump-failed-completion": [nlmsg(3, status(-errno.EINTR), MULTI)],
+            "dump-completion-without-status": [nlmsg(3, b"", MULTI)],
+            "dump-error": [nlmsg(2, status(-errno.ENOENT) + bytes(16))],
+            "dump-error-zero": [nlmsg(2, status(0) + bytes(16))],
+            "dump-no-completion": [LISTENER],
+            "dump-after-completion": [DONE + LISTENER],
+            "dump-other-sequence": [nlmsg(20, diag(socket.AF_INET, 51998), MULTI, seq=7) + DONE],
+            "dump-not-multipart": [nlmsg(20, diag(socket.AF_INET, 51998), 0) + DONE],
+            "dump-other-family": [nlmsg(20, diag(socket.AF_INET6, 51998), MULTI) + DONE],
+            "dump-no-drop-counter": [nlmsg(20, diag(socket.AF_INET, 51998, attribute=False), MULTI) + DONE],
+            "dump-bad-attribute": [nlmsg(20, diag(socket.AF_INET, 51998) [:-36] + struct.pack("=HH", 400, 7), MULTI) + DONE],
+            "dump-short-socket": [nlmsg(20, bytes(40), MULTI) + DONE],
+            "dump-truncated": [(LISTENER + DONE)[:-6]],
+            "dump-trailing-bytes": [LISTENER + DONE + bytes(8)],
+            "dump-overrun": [nlmsg(4) + DONE],
+            "dump-unknown-type": [nlmsg(99) + DONE],
+        }
+        if case.startswith("dump-"):
+            dumps.extend([cases[case], [DONE]])
+            try:
+                print(wire.udp_sockets(51998))
+            except OSError as error:
+                print("refused: %s" % (error.strerror or error))
+        else:
+            watch = wire.DeliveryWatch(51998)
+            watch.events = Events()
+            watch.events.queue = {
+                "events-none": [],
+                "events-one": [nlmsg(20, diag(socket.AF_INET, 51998, cookie=9))],
+                "events-overrun": [nlmsg(4)],
+                "events-error": [nlmsg(2, status(-errno.ENOBUFS) + bytes(16))],
+                "events-short": [bytes(8)],
+                "events-truncated": [nlmsg(20, diag(socket.AF_INET, 51998, cookie=9))[:50]],
+                "events-short-socket": [nlmsg(20, bytes(16))],
+                "events-empty-datagram": [b""],
+            }[case]
+            try:
+                print(watch.destroyed())
+            except OSError as error:
+                print("refused: %s" % (error.strerror or error))
+    else:
+        # rawwatch: a SIP hint and a mac1-consistent initiation from
+        # 192.0.2.2:41006 to port 51998, then the record's polls; the fault
+        # hits the reading after the hint (the second; the first is the
+        # baseline), its two dumps or the notifications before it.
+        KEY = bytes(range(32, 64))
+        NARROW = "40,40,40,40,100000001-100000100,200000001-200000100,300000001-300000100,400000001-400000100"
+        SIP_HINT = b"OPTIONS sip:a@b SIP/2.0\r\n\r\n"
+        body = struct.pack("<II", 100000007, 0x01020304) + bytes(108)
+        mac = hashlib.blake2s(body, digest_size=16, key=hashlib.blake2s(b"mac1----" + KEY).digest()).digest()
+        INITIATION = bytes(40) + body + mac + bytes(16)
+
+        class Clocks:
+            def __init__(self):
+                self.boot_ns, self.real_offset = 100 * SECOND, 1_700_000_000 * SECOND
+
+            def sample(self):
+                self.boot_ns += 1000
+                return wire.ClockSample(self.boot_ns, self.real_offset, 0, 5 * SECOND)
+
+            def boot(self):
+                self.boot_ns += 1000
+                return self.boot_ns
+
+            def sleep(self, nanoseconds):
+                self.boot_ns += nanoseconds
+
+        class Source:
+            def __init__(self):
+                self.queue = []
+
+            def read(self):
+                return self.queue.pop(0) if self.queue else None
+
+            def drops(self):
+                return 0
+
+        class RawWatch(wire.DeliveryWatch):
+            def subscribe(self):
+                self.events = Events()
+
+            def canary(self):
+                self.events.queue.append(nlmsg(20, diag(socket.AF_INET, 33333, cookie=33333)))
+                return 33333
+
+        wire.namespace_losses = lambda: 0
+        fault = {
+            "raw-clean": [None, None],
+            "raw-begin-failed": [[nlmsg(3, status(-errno.EINTR), MULTI)], None],
+            "raw-dump-interrupted": [None, None, [nlmsg(3, status(0), MULTI | INTR)], None],
+            "raw-dump-failed": [None, None, [nlmsg(3, status(-errno.EINTR), MULTI)], None],
+            "raw-dump-error": [None, None, None, [nlmsg(2, status(-errno.ENOENT) + bytes(16))]],
+            "raw-dump-truncated": [None, None, [(LISTENER + DONE)[:-6]], None],
+            "raw-dump-other-sequence": [None, None, [nlmsg(20, diag(socket.AF_INET, 51998), MULTI, seq=7) + DONE], None],
+        }.get(case, [None, None])
+        dumps.extend(fault)
+        clocks, source, out, watch = Clocks(), Source(), io.StringIO(), RawWatch(51998)
+        recorder = wire.Recorder(source, clocks, out, {socket.inet_aton("192.0.2.2")}, None, 51998, clocks.sample(), watch)
+        ready = recorder.begin()
+        clocks.sleep(SECOND)
+        hint_at = clocks.boot_ns - SECOND // 2
+        source.queue = [(ipv4(SIP_HINT, src="192.0.2.2", dst="192.0.2.1", sport=41006, dport=51998), hint_at + clocks.real_offset),
+                        (ipv4(INITIATION, src="192.0.2.2", dst="192.0.2.1", sport=41006, dport=51998),
+                         hint_at + SECOND // 10 + clocks.real_offset)]
+        recorder.batch(256)
+        if case == "raw-notification-overrun":
+            watch.events.queue.append(nlmsg(4))
+        if case == "raw-notification-short":
+            watch.events.queue.append(bytes(8))
+        recorder.poll()
+        clocks.sleep(SECOND)
+        recorder.poll()
+        cutoff = clocks.boot()
+        recorder.finish(cutoff)
+        path = os.path.join(sys.argv[4], case + ".record")
+        with open(path, "w") as record:
+            record.write(out.getvalue())
+        with open(path + ".state", "w") as state:
+            state.write("ready 1 1 %d\nstopped %d %s\n" % (wire.centiseconds_down(ready.boot), recorder.records, "0" * 32))
+        cs = wire.centiseconds_down
+        initiation_cs = cs(hint_at + SECOND // 10)
+        argv = ["auto-expect", path, "192.0.2.2", "41006", NARROW, base64.b64encode(KEY).decode(), "-", "off",
+                str(cs(ready.boot) + 1), str(initiation_cs + 5), str(cs(cutoff)), "%d:%d" % (initiation_cs - 5, initiation_cs + 5), "-"]
+        verdict = io.StringIO()
+        with contextlib.redirect_stdout(verdict):
+            status_code = wire.main(argv)
+        markers = [line for line in out.getvalue().splitlines() if " - " in line]
+        print("markers: %s" % " | ".join(markers))
+        print("%d %s" % (status_code, verdict.getvalue().splitlines()[-1] if verdict.getvalue() else "-"))
+elif cmd == "recorder":
+    # recorder <case>: the record's core (Recorder) on a scripted packet
+    # source and scripted clocks, its lines printed with bytes abbreviated.
+    import errno, io
+    case = sys.argv[3]
+    SECOND = 10 ** 9
+
+    class Clocks:
+        """Realtime is boottime plus REAL_OFFSET. A reading is taken as
+        SystemClocks takes it: realtime, boottime, monotonic, realtime; the
+        reading numbered PAUSE_AT is preempted for PAUSE between its first
+        realtime read and its boottime read; SPREAD widens every reading's
+        realtime bracket."""
+
+        def __init__(self):
+            self.boot_ns, self.real_offset, self.mono_offset = 100 * SECOND, 1_700_000_000 * SECOND, 5 * SECOND
+            self.calls, self.pause_at, self.pause, self.spread = 0, None, 3 * SECOND, 0
+
+        def sample(self):
+            self.calls += 1
+            self.boot_ns += 1000
+            real_before = self.boot_ns + self.real_offset
+            if self.calls == self.pause_at:
+                self.boot_ns += self.pause
+            boot = self.boot_ns
+            real_after = self.boot_ns + self.real_offset
+            return wire.ClockSample(boot, (real_before + real_after) // 2 - boot, real_after - real_before + self.spread,
+                                    self.mono_offset)
+
+        def boot(self):
+            self.boot_ns += 1000
+            return self.boot_ns
+
+        def sleep(self, nanoseconds):
+            self.boot_ns += nanoseconds
+
+    class Source:
+        """Frames queued with their kernel stamps; DROPPED counts like
+        PACKET_STATISTICS and resets on reading; ENDLESS keeps the queue full;
+        HOOKS[n] runs right after the nth reading resets the count."""
+
+        def __init__(self):
+            self.queue, self.dropped, self.endless, self.calls, self.hooks = [], 0, False, 0, {}
+
+        def read(self):
+            if self.endless:
+                clocks.sleep(10 ** 7)
+                return (ipv4(b"x" * 8), None)
+            return self.queue.pop(0) if self.queue else None
+
+        def drops(self):
+            self.calls += 1
+            dropped, self.dropped = self.dropped, 0
+            if self.calls in self.hooks:
+                self.hooks[self.calls]()
+            return dropped
+
+    class Watch(wire.DeliveryWatch):
+        """DeliveryWatch on scripted sockets (SOCKETS, cookie: (peer,
+        drops)), namespace counter (COUNTER), destructions (GONE_EVENTS, and
+        DURING_DUMP[n]: those notified while the nth dump runs), a canary
+        notified when it is closed unless FAIL holds "slow", and failures
+        (FAIL: subscribe, dump, events)."""
+
+        def __init__(self):
+            super().__init__(40000)
+            self.sockets, self.counter, self.gone_events, self.fail = {}, 0, [], set()
+            self.dumps, self.during_dump, self.identity = 0, {}, 33333
+
+        def subscribe(self):
+            if "subscribe" in self.fail:
+                raise OSError(errno.EPERM, "no notifications")
+
+        def destroyed(self):
+            if "events" in self.fail:
+                self.fail.discard("events")
+                raise OSError(errno.ENOBUFS, "notifications lost")
+            found, self.gone_events = self.gone_events, []
+            return found
+
+        def canary(self):
+            # Its notification carries IDENTITY as both cookie and port: the
+            # canary's whether it is matched by cookie or by port. A case
+            # that gives the canary the watched port adds a server socket's
+            # notification on that port too.
+            if "slow" not in self.fail:
+                self.gone_events.append((self.identity, self.identity, "any"))
+            return self.identity
+
+    def scripted_sockets(port):
+        watch.dumps += 1
+        watch.gone_events.extend(watch.during_dump.pop(watch.dumps, []))
+        if watch.dumps == getattr(watch, "fail_at", None):
+            raise OSError(errno.EINTR, "dump failed")
+        if "dump" in watch.fail:
+            watch.fail.discard("dump")
+            raise OSError(errno.EIO, "dump failed")
+        return dict(watch.sockets)
+
+    wire.udp_sockets = scripted_sockets
+    wire.namespace_losses = lambda: watch.counter
+    clocks, source, out, watch = Clocks(), Source(), io.StringIO(), Watch()
+    source.dropped = 7  # before the record exists: not its business
+    CLIENT_PEER = "192.0.2.1:51820"
+    watch.sockets = {1: ("any", 0), 2: (CLIENT_PEER, 0)}
+    if case.startswith("capture-"):
+        recorder = wire.CaptureRecorder(source, clocks, out, SERVER, 51820, None, clocks.sample(), None, None, None)
+    else:
+        recorder = wire.Recorder(source, clocks, out, {SERVER}, None, 40000, clocks.sample(),
+                                 watch if case.startswith("delivery-") else None)
+    def stamped(payload, before_ns):
+        return (ipv4(payload), clocks.boot_ns - before_ns + clocks.real_offset)
+    def preempted_after_reset():
+        # The counters were just reset; the recorder is preempted for 2 s,
+        # and 993 frames are dropped 1 s into it.
+        print("reset-cs %d" % (clocks.boot_ns // 10 ** 7))
+        clocks.sleep(SECOND)
+        source.dropped = 993
+        print("lost-cs %d" % (clocks.boot_ns // 10 ** 7))
+        clocks.sleep(SECOND)
+    if case == "begin-preempted":
+        source.hooks[1] = preempted_after_reset
+    if case == "delivery-unavailable":
+        watch.fail.add("subscribe")
+    ready = recorder.begin()
+    print("watch-cs %d" % (recorder.watched // 10 ** 7))
+    if case == "delayed-ready":
+        # Drops after readiness, before the first poll, are reported.
+        source.dropped = 993
+        clocks.sleep(SECOND)
+        recorder.batch(256)
+        recorder.poll()
+        recorder.finish(clocks.boot())
+    elif case == "queued-at-stop":
+        # Everything queued when the stop came is read before the end marker.
+        source.queue = [stamped(b"p%02d" % i, 2 * SECOND) for i in range(50)]
+        recorder.finish(clocks.boot())
+    elif case == "dequeue-delay":
+        # A frame read 2.2 s after it arrived is recorded at its arrival.
+        clocks.sleep(3 * SECOND)
+        arrived = clocks.boot_ns - 22 * SECOND // 10
+        source.queue = [(ipv4(b"late"), arrived + clocks.real_offset)]
+        recorder.batch(256)
+        print("arrival-error-cs %d" % (int(out.getvalue().split()[0]) - arrived // 10 ** 7))
+        recorder.finish(clocks.boot())
+    elif case == "no-stamp":
+        clocks.sleep(SECOND)
+        source.queue = [(ipv4(b"none"), None)]
+        recorder.batch(256)
+        recorder.finish(clocks.boot())
+    elif case == "clock-step":
+        # The realtime clock steps while the frame waits: its stamp no longer
+        # converts, so its arrival is the interval it must lie in.
+        clocks.sleep(SECOND)
+        source.queue = [stamped(b"step", SECOND // 2)]
+        clocks.real_offset += 3 * SECOND
+        recorder.batch(256)
+        recorder.poll()
+        recorder.finish(clocks.boot())
+    elif case == "suspend":
+        clocks.sleep(SECOND)
+        clocks.mono_offset += 40 * SECOND
+        recorder.poll()
+        recorder.finish(clocks.boot())
+    elif case == "endless":
+        # Traffic that never lets the queue empty: the drain gives up in time.
+        source.endless = True
+        recorder.finish(clocks.boot())
+    elif case in ("wide-after", "wide-empty"):
+        # A clock reading preempted for 3 s between its two realtime reads
+        # brackets the offset 3 s wide: the reading after the frame was read,
+        # or the one before the queue was last found empty. The frame's
+        # arrival is the interval that bracket allows, never its middle as
+        # an exact stamp.
+        clocks.sleep(SECOND)
+        if case == "wide-empty":
+            clocks.pause_at = clocks.calls + 1
+            recorder.batch(256)
+            clocks.sleep(SECOND)
+            arrived = clocks.boot_ns - SECOND // 2
+            source.queue = [(ipv4(b"wide"), arrived + clocks.real_offset)]
+        else:
+            arrived = clocks.boot_ns - SECOND // 2
+            source.queue = [(ipv4(b"wide"), arrived + clocks.real_offset)]
+            clocks.pause_at = clocks.calls + 2
+        recorder.batch(256)
+        print("arrived-cs %d" % (arrived // 10 ** 7))
+        recorder.finish(clocks.boot())
+    elif case in ("straddle", "narrow-boundary"):
+        # A stamp 1 ms past a centisecond: with every reading's bracket 6 ms
+        # wide, the arrival spans the boundary and is an interval; with
+        # exact readings it is that centisecond.
+        if case == "straddle":
+            clocks.spread = 6 * 10 ** 6
+        clocks.sleep(SECOND)
+        arrived = (clocks.boot_ns // 10 ** 7 - 10) * 10 ** 7 + 10 ** 6
+        source.queue = [(ipv4(b"edge"), arrived + clocks.real_offset)]
+        recorder.batch(256)
+        print("arrived-cs %d" % (arrived // 10 ** 7))
+        recorder.finish(clocks.boot())
+    elif case in ("poll-preempted", "begin-preempted", "finish-preempted"):
+        # The review's interleaving: the counters reset, the recorder is
+        # preempted before its next clock reading, and frames are dropped
+        # meanwhile. Their interval must contain when they were dropped:
+        # from the reading before the reset. At the first poll, at the
+        # baseline taken before readiness, or at the last regular poll
+        # before the stop's final collection.
+        clocks.sleep(SECOND)
+        if case == "poll-preempted":
+            source.hooks[source.calls + 1] = preempted_after_reset
+            recorder.poll()
+            clocks.sleep(SECOND)
+            recorder.poll()
+        elif case == "begin-preempted":
+            recorder.poll()
+        else:
+            source.hooks[source.calls + 1] = preempted_after_reset
+            recorder.poll()
+        recorder.finish(clocks.boot())
+    elif case.startswith("delivery-"):
+        # The delivery watch on scripted sockets: the listener (cookie 1),
+        # the socket connected to the client (2), others as a case adds them,
+        # each change between the first and the second poll.
+        clocks.sleep(SECOND)
+        recorder.poll()
+        clocks.sleep(SECOND)
+        if case == "delivery-listener":
+            watch.sockets[1] = ("any", 5)
+        elif case == "delivery-connected":
+            watch.sockets[2] = (CLIENT_PEER, 3)
+        elif case == "delivery-new-socket":
+            watch.sockets[3] = (CLIENT_PEER, 2)
+        elif case == "delivery-reconnected":
+            watch.sockets[1] = (CLIENT_PEER, 4)
+        elif case == "delivery-retired":
+            del watch.sockets[2]
+        elif case == "delivery-unseen":
+            watch.gone_events = [(9, 40000, CLIENT_PEER)]
+        elif case == "delivery-other-port":
+            watch.gone_events = [(9, 40001, CLIENT_PEER)]
+        elif case == "delivery-namespace":
+            watch.counter = 4
+        elif case == "delivery-dump-fails":
+            watch.fail.add("dump")
+        elif case == "delivery-events-lost":
+            watch.fail.add("events")
+        elif case == "delivery-unavailable":
+            watch.sockets[1] = ("any", 5)
+        elif case == "delivery-during-dump":
+            # Notified while the second poll's dump runs: reconciled by it.
+            watch.during_dump[3] = [(7, 40000, CLIENT_PEER)]
+        elif case == "delivery-final-dump":
+            # A socket no reading saw, destroyed while the final collection's
+            # first dump runs (dumps: begin, two polls, then the final two).
+            watch.during_dump[4] = [(7, 40000, CLIENT_PEER)]
+        elif case == "delivery-final-last-dump":
+            watch.during_dump[5] = [(7, 40000, CLIENT_PEER)]
+        elif case == "delivery-final-settle":
+            # Notified only while the final collection waits.
+            canary = watch.canary
+            watch.canary = lambda: (watch.gone_events.append((7, 40000, CLIENT_PEER)), canary())[1]
+        elif case == "delivery-slow-notifications":
+            watch.fail.add("slow")
+        elif case == "delivery-final-failed-last-dump":
+            # The fifth review's first case: an unseen socket's destruction
+            # is notified while the final collection waits, then its last
+            # dump fails.
+            canary = watch.canary
+            watch.canary = lambda: (watch.gone_events.append((7, 40000, CLIENT_PEER)), canary())[1]
+            watch.fail_at = 5
+        elif case == "delivery-dump-fails-pending":
+            # The same in a regular poll: notified during its dump, which
+            # fails; the poll after it succeeds.
+            watch.during_dump[3] = [(7, 40000, CLIENT_PEER)]
+            watch.fail_at = 3
+        elif case == "delivery-canary-port-reuse":
+            # The fifth review's second case: the watched port is free and
+            # the canary is given it; a server socket's destruction on that
+            # port is notified while the final collection waits.
+            watch.identity = 40000
+            canary = watch.canary
+            watch.canary = lambda: (watch.gone_events.append((7, 40000, CLIENT_PEER)), canary())[1]
+        print("poll-cs %d" % (clocks.boot_ns // 10 ** 7))
+        recorder.poll()
+        cutoff = clocks.boot()
+        print("cutoff-cs %d" % (cutoff // 10 ** 7))
+        recorder.finish(cutoff)
+    elif case in ("capture-queued", "capture-drops", "capture-endless"):
+        # capture's records on the record's machinery: what is queued at the
+        # stop is drained; a dropped frame or an unfinished drain leaves it
+        # not whole.
+        good = bytes.fromhex("000100002112a442") + bytes(92)
+        source.queue = [(ipv4(good), None) for _ in range(22)] + [(ipv4(bytes(100)), None)]
+        if case == "capture-drops":
+            source.dropped = 3
+        if case == "capture-endless":
+            source.endless = True
+        recorder.finish(clocks.boot())
+        print("capture records %d losses %d complete %s" % (recorder.records, recorder.losses, recorder.complete))
+    print("ready %d" % wire.centiseconds_down(ready.boot))
+    for line in out.getvalue().splitlines():
+        fields = line.split(" ")
+        if len(fields) == 5 and fields[1] != "-":
+            fields[4] = "<%d bytes>" % (len(fields[4]) // 2)
+        print(" ".join(fields))
 PY
 }
 kinds() { # <capture> <S1,S2,S3,S4>
@@ -460,6 +971,770 @@ assert_eq 2 "$?" "a capture given a layout without the receiver key is refused (
 "${REAL_PYTHON}" "${WIRE_REAL}" "${CAPTURE_ARGS[@]}" not-a-key >/dev/null 2>&1
 assert_eq "1 absent" "$? $(test -e "${T}/args.capture.state" && echo present || echo absent)" \
 	"  as is one given a key that is not 32 base64 bytes, before it writes anything"
+"${REAL_PYTHON}" "${WIRE_REAL}" capture-to 40001 lo 127.0.0.1 51820 1 "${T}/to.capture" "29,26,81,22,${H}" >/dev/null 2>&1
+assert_eq 2 "$?" "capture-to given a layout without the receiver key is refused (usage)"
+for PORT in x 0x10 65536 -1 ""; do
+	"${REAL_PYTHON}" "${WIRE_REAL}" capture-to "${PORT}" lo 127.0.0.1 51820 1 "${T}/to.capture" >/dev/null 2>&1
+	assert_eq "1 absent" "$? $(test -e "${T}/to.capture.state" && echo present || echo absent)" \
+		"capture-to refuses the destination port '${PORT}' before it writes anything"
+done
+
+echo "=== One client's stream among several behind one address (capture-to) ==="
+# Datagrams from the server 192.0.2.1:51820 to two clients behind 192.0.2.2,
+# ports 40001 and 40002, through frame_payload as capture-to uses it.
+CAPTURE_TO="$("${REAL_PYTHON}" - "${WIRE_REAL}" <<'PY'
+import importlib.util, struct, sys
+spec = importlib.util.spec_from_file_location("wire", sys.argv[1])
+wire = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(wire)
+SERVER, CLIENT = bytes([192, 0, 2, 1]), bytes([192, 0, 2, 2])
+
+def frame(dport, payload, ident=1, offset=0, more=False, udp_length=None, body=None):
+    if body is None:
+        body = struct.pack(">HHHH", 51820, dport, udp_length or 8 + len(payload), 0) + payload
+    flags = (0x2000 if more else 0) | (offset // 8)
+    return struct.pack(">BBHHHBBH4s4s", 0x45, 0, 20 + len(body), ident, flags, 64, 17, 0, SERVER, CLIENT) + body
+
+def status(result):
+    return {wire.DATAGRAM: "datagram", wire.IGNORE: "ignore", wire.MALFORMED: "malformed",
+            wire.CONTINUATION: "continuation"}[result[0]]
+
+out = []
+frags = wire.Fragments()
+for dport in (40001, 40002):
+    out.append(status(wire.frame_payload(frame(dport, b"x" * 40), SERVER, 51820, destination_port=40001, fragments=frags)))
+# A datagram of 1600 bytes to the other client, in two fragments.
+first = struct.pack(">HHHH", 51820, 40002, 1608, 0) + b"y" * 1472
+out.append(status(wire.frame_payload(frame(0, b"", ident=7, more=True, body=first), SERVER, 51820, destination_port=40001, fragments=frags)))
+out.append(status(wire.frame_payload(frame(0, b"", ident=7, offset=1480, body=b"y" * 128), SERVER, 51820, destination_port=40001, fragments=frags)))
+# The same later fragment with no first fragment seen is malformed, as before.
+out.append(status(wire.frame_payload(frame(0, b"", ident=8, offset=1480, body=b"y" * 128), SERVER, 51820, destination_port=40001, fragments=frags)))
+# Without a destination port every client's datagram is relevant, as capture records it.
+out.append(status(wire.frame_payload(frame(40002, b"x" * 40), SERVER, 51820, fragments=wire.Fragments())))
+print(" ".join(out))
+PY
+)"
+assert_eq "datagram ignore ignore continuation malformed datagram" "${CAPTURE_TO}" \
+	"capture-to records its client's datagram, skips the other client's and that one's later fragment, and still flags an orphan fragment"
+
+echo "=== Auto: shaped prefixes, probe replies and the rest (classify-auto) ==="
+# Prefixes as a capture without layout records them: a dns-shaped S prefix
+# (flags 0x0120, one question), a DNS SERVFAIL reply, a stun-shaped prefix
+# (Binding Request, magic cookie), a Binding Success, a QUIC short header, a
+# Version Negotiation, a SIP request line, and random bytes.
+DNS_S="12340120000100000000000107657861"
+DNS_REPLY="12348182000100000000000007657861"
+STUN_S="000100002112a442aabbccddeeff0011"
+STUN_REPLY="010100302112a442aabbccddeeff0011"
+QUIC_S="4f0011223344556677889900aabbccdd"
+QUIC_REPLY="80000000000811223344556677880811"
+SIP_S="$(printf 'OPTIONS sip:a@b ' | od -An -tx1 | tr -d ' \n')"
+RANDOM_S="9c3e5f17a20b44d1e8c0f7a6b5d4c3b2"
+printf '%s\n' "${DNS_S}" "${DNS_S}" "${DNS_REPLY}" >"${T}/auto-dns"
+printf '%s\n' "${STUN_S}" "${STUN_REPLY}" "${STUN_REPLY}" "${RANDOM_S}" >"${T}/auto-stun"
+printf '%s\n' "${QUIC_S}" "${QUIC_REPLY}" >"${T}/auto-quic"
+printf '%s\n' "${SIP_S}" "${RANDOM_S}" >"${T}/auto-sip"
+printf '%s\n' "${RANDOM_S}" "${RANDOM_S}" "${QUIC_S}" >"${T}/auto-none"
+printf '%s\n' "${RANDOM_S}" "${DNS_S}" "${STUN_S}" "${SIP_S}" >"${T}/auto-none-shaped"
+for CASE in "dns auto-dns 3 2 1 0" "stun auto-stun 4 1 2 1" "quic auto-quic 2 1 1 0" "sip auto-sip 2 1 0 1" \
+	"none auto-none 3 0 0 3" "none auto-none-shaped 4 3 0 1" "dns auto-stun 4 0 0 4"; do
+	read -r PROTOCOL FILE WANT <<<"${CASE}"
+	assert_eq "${WANT}" "$("${REAL_PYTHON}" "${WIRE_REAL}" classify-auto "${PROTOCOL}" "${T}/${FILE}" 2>&1)" \
+		"classify-auto ${PROTOCOL} on ${FILE}: datagrams, shaped, probe replies, other"
+done
+printf '%s\n' "${DNS_S}" "response 124 -" >"${T}/auto-mixed"
+"${REAL_PYTHON}" "${WIRE_REAL}" classify-auto dns "${T}/auto-mixed" >/dev/null 2>&1
+assert_eq 1 "$?" "classify-auto refuses a per-kind record, as classify does"
+"${REAL_PYTHON}" "${WIRE_REAL}" classify-auto auto "${T}/auto-dns" >/dev/null 2>&1
+assert_eq 1 "$?" "classify-auto has no classification for auto itself"
+"${REAL_PYTHON}" "${WIRE_REAL}" send sip 127.0.0.1 9 70000 >/dev/null 2>&1
+assert_eq 1 "$?" "send refuses a source port beyond 65535"
+SEND_PORT=$((30000 + RANDOM % 20000))
+SENT="$("${REAL_PYTHON}" - "${WIRE_REAL}" "${SEND_PORT}" <<'PY'
+import socket, subprocess, sys
+listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+listener.bind(("127.0.0.1", 0))
+listener.settimeout(5)
+out = subprocess.run([sys.executable, sys.argv[1], "send", "sip", "127.0.0.1", str(listener.getsockname()[1]), sys.argv[2]],
+                     capture_output=True, text=True)
+data, source = listener.recvfrom(65535)
+print(out.returncode, out.stdout.strip(), source[1] == int(sys.argv[2]), data == b"OPTIONS sip:a@b SIP/2.0\r\n\r\n")
+PY
+)"
+assert_eq "0 sent 27 True True" "${SENT}" \
+	"send sends the 27-byte SIP request line from the given source port, shorter than any AmneziaWG datagram, and says so"
+"${REAL_PYTHON}" "${WIRE_REAL}" send dns 127.0.0.1 9 40000 >/dev/null 2>&1
+assert_eq 2 "$?" "send plants only the hints it knows to be no AmneziaWG datagram (usage)"
+
+echo "=== Which planted datagram the server can take for AmneziaWG (candidates) ==="
+# The S sizes of the BoringTun Host job whose planted 247-byte SIP probe was
+# not learned (run 37615364152), with an H4 that holds the probe's bytes at
+# S4 = 37, and with one that does not.
+H_LOW="100000001-100000100,200000001-200000100,300000001-300000100"
+COLLIDING="27,113,125,37,${H_LOW},1767000000-1866999999"
+CLEAR="27,113,125,37,${H_LOW},1900000000-1999999999"
+# Every u32 in some H range, every S at 0, and H4 holding the probe's first
+# four bytes ("OPTI", 1230262351): the widest a layout can be.
+EVERYTHING="0,0,0,0,0-1073741823,2147483648-3221225471,3221225472-4294967295,1073741824-2147483647"
+for CASE in "probe ${COLLIDING} 247 transport" "probe ${CLEAR} 247 none" "send ${COLLIDING} 27 none" "send ${CLEAR} 27 none" \
+	"send ${EVERYTHING} 27 none" "probe ${EVERYTHING} 247 transport"; do
+	read -r SOURCE LAYOUT WANT_LENGTH WANT_KINDS <<<"${CASE}"
+	assert_eq "${WANT_LENGTH} ${WANT_KINDS}" "$("${REAL_PYTHON}" "${WIRE_REAL}" candidates "${SOURCE}" sip "${LAYOUT}" 2>&1)" \
+		"candidates: the ${SOURCE} sip datagram under ${LAYOUT%%,1*}… fits: ${WANT_KINDS}"
+done
+"${REAL_PYTHON}" "${WIRE_REAL}" candidates send dns "${CLEAR}" >/dev/null 2>&1
+assert_eq 2 "$?" "candidates knows only the datagrams send and probe send (usage)"
+
+echo "=== Auto: what the server can learn, from what reached it (detect, inbound_candidates, auto-expect) ==="
+# The pre-initiation datagrams of real BoringTun clients (the published
+# b94943906b11 binary, --imitate-protocol dns, quic, sip and stun), recorded
+# whole on the server's side under S1-S4 40 and narrow H ranges: imitation
+# datagrams and Jc junk, public bytes only.
+PRELUDES="${SCRIPT_DIR}/fixtures/boringtun-auto-preludes"
+# Upstream's own detection vectors (noise/imitation/detect.rs tests), and the
+# recorded preludes: what each is detected as.
+DETECTED="$("${REAL_PYTHON}" - "${WIRE_REAL}" "${PRELUDES}" <<'PY'
+import importlib.util, struct, sys
+spec = importlib.util.spec_from_file_location("wire", sys.argv[1])
+wire = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(wire)
+def dns_query(txid):
+    return bytes([txid[0], txid[1], 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]) + b"\x07example\x03com\x00" + bytes([0, 1, 0, 1])
+stun = b"\x00\x01\x00\x00" + bytes.fromhex("2112a442") + b"\xab" * 12
+quic = bytes([0xC3]) + struct.pack(">I", 1) + bytes([4, 1, 2, 3, 4, 0]) + bytes(16)
+def version(value):
+    return quic[:1] + struct.pack(">I", value) + quic[5:]
+bad_stun = bytearray(stun); bad_stun[3] = 4
+q0 = bytearray(dns_query(b"\x01\x02")); q0[5] = 0
+q1 = bytearray(dns_query(b"\x01\x02")); q1[12] = 0xC0
+q2 = bytearray(dns_query(b"\x01\x02")); q2[-1] = 9
+cases = [("dns query", dns_query(b"\x12\x34")), ("dns query, txid c0", dns_query(b"\xc0\x34")),
+         ("dns query, txid ff", dns_query(b"\xff\x34")), ("stun binding request", stun), ("quic v1 initial", quic),
+         ("INVITE", b"INVITE sip:a@b SIP/2.0\r\n\r\n"), ("OPTIONS", b"OPTIONS sip:a@b SIP/2.0\r\n\r\n"),
+         ("sip/2.0 response", b"sip/2.0 100 Trying\r\n\r\n"), ("BYE with a multibyte name", b"BYE sip:x\xc3\xa4@b SIP/2.0\r\n\r\n"),
+         ("SUBSCRIBE", b"SUBSCRIBE \xc3\xa4 SIP/2.0\r\n\r\n"), ("empty", b""), ("one byte", b"\x00"), ("six c0", b"\xc0" * 6),
+         ("quic draft 0", version(0xFF000000)), ("quic draft 1", version(0xFF000001)), ("quic grease", version(0x1A2A3A4A)),
+         ("quic version 2 (unassigned)", version(2)), ("stun with a wrong length", bytes(bad_stun)),
+         ("dns, no question", bytes(q0)), ("dns, compressed name", bytes(q1)), ("dns, bad qclass", bytes(q2)),
+         ("dns, cut short", dns_query(b"\x01\x02")[:14])]
+for name, data in cases:
+    print("%s: %s" % (name, wire.detect(data)))
+for protocol in ("dns", "quic", "sip", "stun"):
+    found = [wire.detect(bytes.fromhex(line)) for line in open("%s/%s.hex" % (sys.argv[2], protocol)).read().split()]
+    print("recorded %s prelude: %s" % (protocol, " ".join(str(item) for item in found)))
+PY
+)"
+assert_eq "dns query: dns
+dns query, txid c0: dns
+dns query, txid ff: dns
+stun binding request: stun
+quic v1 initial: quic
+INVITE: sip
+OPTIONS: sip
+sip/2.0 response: sip
+BYE with a multibyte name: sip
+SUBSCRIBE: sip
+empty: None
+one byte: None
+six c0: None
+quic draft 0: None
+quic draft 1: quic
+quic grease: quic
+quic version 2 (unassigned): None
+stun with a wrong length: None
+dns, no question: None
+dns, compressed name: None
+dns, bad qclass: None
+dns, cut short: None
+recorded dns prelude: dns dns dns dns dns dns
+recorded quic prelude: quic quic None None
+recorded sip prelude: sip sip sip sip sip
+recorded stun prelude: stun stun None None None" "${DETECTED}" \
+	"detect: upstream's own vectors, and what real clients send before their initiation (Jc junk aside, two QUIC datagrams carry a v1 connection ID over 20 bytes, which upstream does not take for QUIC)"
+
+assert_eq "10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4ed2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e" \
+	"$(py chacha20 2>&1)" "the header-protection keystream's ChaCha20 block is RFC 8439's (section 2.3.2 test vector)"
+
+# auto-expect over synthetic records: the datagrams that reached the server
+# (initiations carry a mac1 computed here, as WireGuard defines it, under the
+# server's public key), each with its arrival clock, and the scenario's
+# evidence: when each client process started and when it first pinged
+# through the tunnel (an establishment), and, where a case says so, when a
+# connected socket to the client was seen. CASE names what it builds; the
+# helper's verdict is compared with what upstream's rules give for every
+# history that evidence allows, worked out in the comment of each case.
+STUN_CLEAR="110,57,133,36,66166068-166166067,862271148-962271147,1349667297-1449667296,2030000000-2129999999"
+auto_case() { # <case> [<epoch> <window start> <window end>]
+	"${REAL_PYTHON}" - "${WIRE_REAL}" "${PRELUDES}" "${T}/auto-record" "$@" <<'PY'
+import base64, contextlib, hashlib, importlib.util, io, os, struct, sys
+spec = importlib.util.spec_from_file_location("wire", sys.argv[1])
+wire = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(wire)
+preludes, path, case = sys.argv[2], sys.argv[3], sys.argv[4]
+SERVER = bytes(range(32, 64))
+HP = bytes(range(64, 96))
+with open(path + ".hp", "w") as key:
+    key.write(base64.b64encode(HP).decode() + "\n")
+COLLIDING = "110,57,133,36,66166068-166166067,862271148-962271147,1349667297-1449667296,1917290954-2017290953"
+CLEAR = "110,57,133,36,66166068-166166067,862271148-962271147,1349667297-1449667296,2030000000-2129999999"
+NARROW = "40,40,40,40,100000001-100000100,200000001-200000100,300000001-300000100,400000001-400000100"
+SHORT = "20,24,28,30,100000001-100000100,200000001-200000100,300000001-300000100,400000001-400000100"
+def recorded(protocol):
+    return [bytes.fromhex(line) for line in open("%s/%s.hex" % (preludes, protocol)).read().split()]
+def mask(datagram, offset, length, hp):
+    if not hp:
+        return datagram
+    stream = wire.hp_keystream(HP, datagram, length)
+    return datagram[:offset] + bytes(a ^ b for a, b in zip(datagram[offset:offset + length], stream)) + datagram[offset + length:]
+def initiation(prefix=None, valid=True):
+    """An init candidate whose mac1 is consistent with the server's key (or
+    not): what a client sends, and what anyone who knows the key can forge."""
+    sizes, ranges = wire.parse_layout(layout)
+    body = struct.pack("<II", ranges[0][0] + 7, 0x01020304) + os.urandom(108)
+    mac = hashlib.blake2s(body, digest_size=16, key=hashlib.blake2s(b"mac1----" + SERVER).digest()).digest()
+    if not valid:
+        mac = bytes(b ^ 1 for b in mac)
+    head = (prefix or b"")[:sizes[0]] + os.urandom(max(0, sizes[0] - len(prefix or b"")))
+    return mask(head + body + mac + bytes(16), sizes[0], 148, hp)
+def transport(counter=0):
+    sizes, ranges = wire.parse_layout(layout)
+    datagram = os.urandom(sizes[3]) + struct.pack("<IIQ", ranges[3][0] + 9, 0x0A0B0C0D, counter) + os.urandom(48)
+    return mask(datagram, sizes[3], 16, hp)
+SIP_HINT = b"OPTIONS sip:a@b SIP/2.0\r\n\r\n"
+A, OTHER = "192.0.2.2", "192.0.2.9"
+lines = []
+def add(clock, data, address=A, port=41006):
+    lines.append("%s %s %d %d %s" % (clock, address, port, len(data), data.hex() or "-"))
+def sequence(start, datagrams, address=A, port=41006):
+    for index, data in enumerate(datagrams):
+        add(start + index, data, address, port)
+ready, epoch, window = 1000, 1500, (1900, 20000)
+layout, hp, connected = CLEAR, False, "-"
+# The record watched delivery to the server's sockets, and nothing was lost,
+# unless a case says otherwise.
+watched = watch_end = True
+# A client process started at 1995 and pinged through the tunnel at 2040,
+# unless a case says otherwise.
+est = [(1995, 2040)]
+if case == "stun-colliding":
+    # Both STUN requests are transport candidates under H4 (their bytes at 36
+    # are in it), the junk is detected as nothing: no hint; the initiation's
+    # random S1 prefix is no protocol either. Unresolved: random.
+    layout = COLLIDING
+    sequence(2000, recorded("stun") + [initiation(), transport()])
+elif case == "stun-clear":
+    # Only H4 differs: the first STUN request is the hint, at most 0.41 s old
+    # when the initiation the client's ping proves was processed: stun.
+    sequence(2000, recorded("stun") + [initiation(), transport()])
+elif case == "other-port":
+    # The same sequence from another port of the same address leaves a hint
+    # for that port only.
+    sequence(2000, recorded("stun"), port=41007)
+    sequence(2010, [initiation(), transport()])
+elif case == "other-address":
+    sequence(2000, recorded("stun"), address=OTHER)
+    sequence(2010, [initiation(), transport()])
+elif case in ("age-28", "age-32", "age-30"):
+    # A hint planted at 2000, the client 28, 30.2 or 32 s later. At most 28.31
+    # s old when the initiation was processed (by its ping): live, sip. Older,
+    # nothing bounds when the server processed the hint, which may have come
+    # to it as late as the initiation: undecided, never random by arrival
+    # times alone.
+    add(2000, SIP_HINT)
+    at = 2000 + {"age-28": 2800, "age-30": 3020, "age-32": 3200}[case]
+    est = [(at - 10, at + 30)]
+    sequence(at, [initiation(), transport()])
+elif case == "first-hint-wins":
+    # The first detected protocol per source stays while it lives.
+    sequence(2000, [recorded("quic")[0], SIP_HINT, initiation(), transport()])
+elif case == "from-initiation":
+    # No hint: detect over the initiation datagram, whose S1 prefix is a DNS
+    # query here, selects dns.
+    layout = NARROW
+    query = bytes([0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]) + b"\x16" + b"a" * 22 + b"\x00\x00\x01\x00\x01"
+    sequence(2000, [initiation(prefix=query), transport()])
+elif case == "hp-sip-large":
+    # Header protection with an S of 31 bytes or more refuses sip.
+    layout, hp = NARROW, True
+    sequence(2000, [SIP_HINT, initiation(), transport()])
+elif case == "hp-sip-small":
+    # With every S of 12 to 30 bytes, sip is kept.
+    layout, hp = SHORT, True
+    sequence(2000, [SIP_HINT, initiation(), transport()])
+elif case == "hp-unmasked-initiation":
+    # Under header protection an unmasked initiation fits no kind.
+    layout, hp = NARROW, True
+    hp = False
+    datagrams = [SIP_HINT, initiation()]
+    hp = True
+    sequence(2000, datagrams + [transport()])
+elif case == "no-initiation":
+    sequence(2000, [SIP_HINT, initiation(valid=False), transport()])
+elif case in ("policy-retry", "policy-retry-connected"):
+    # Finding 1 (the review's counterexample): AWG 3.0, S 40. A SIP hint, a
+    # client without imitation whose initiation the server accepts and whose
+    # sip the policy refuses; the client restarts on the same port with DNS
+    # imitation. Its DNS queries reach either the listener, where the refused
+    # SIP hint still holds the slot (random), or the connected socket the
+    # first session opened, whose tunnel takes the first query as its hint
+    # (dns): undecided. With the connected socket seen at 2300, before the
+    # second client, every later datagram reached it: dns.
+    layout, hp = NARROW, True
+    add(2000, SIP_HINT)
+    sequence(2050, [initiation(), transport(), transport(1)])
+    sequence(2381, recorded("dns") + [initiation(), transport(), transport(1)])
+    est = [(1990, 2080), (2380, 2470)]
+    window = (2480, 3000)
+    if case == "policy-retry-connected":
+        connected = "2300"
+elif case == "forgery":
+    # Finding 2 (the review's counterexample): a STUN hint, an initiation
+    # whose mac1 is consistent with the server's key but that no Noise
+    # handshake accepts, and a transport candidate with a low counter; 32 s
+    # later a SIP hint and the real client. Syntax proves neither acceptance:
+    # if the forgery was accepted, stun; if not, the STUN hint may or may not
+    # have expired when the SIP hint came (stun or sip): undecided.
+    layout = NARROW
+    sequence(2000, [recorded("stun")[0], initiation(), transport(1)])
+    add(5250, SIP_HINT)
+    sequence(5300, [initiation(), transport()])
+    est = [(5260, 5340)]
+    window = (5250, 6000)
+elif case in ("gap-full", "gap-hidden", "gap-before-epoch", "gap-after-pin"):
+    # Finding 3 (the review's counterexample): a real STUN session, then 32 s
+    # later the same peer reconnects with a SIP hint; the server keeps the
+    # stun it learned. With the first session recorded: stun. With it
+    # replaced by the record's drop interval: undecided, since the hidden
+    # frames may hold a session that pinned the peer. A drop interval before
+    # the epoch, or one that came after the selection was certainly pinned,
+    # cannot change it: stun.
+    layout = NARROW
+    first = recorded("stun") + [initiation(), transport(), transport(1)]
+    if case == "gap-hidden":
+        lines.append("2060 - drops %d 1996" % len(first))
+    else:
+        sequence(2000, first)
+    if case == "gap-before-epoch":
+        lines.insert(0, "1450 - drops 30 1400")
+    if case == "gap-after-pin":
+        lines.append("3100 - drops 12 3000")
+    add(5210, SIP_HINT)
+    sequence(5250, [initiation(), transport()])
+    est = [(1995, 2050), (5200, 5290)]
+    window = (5300, 6000)
+elif case in ("timing-fresh", "timing-paused", "timing-untimed", "timing-untimed-fresh", "timing-step"):
+    # Finding 4: a SIP hint, then the client. Fresh (the client 3 s later):
+    # sip. The review's pause, recorded at the arrival times it really had
+    # (32 s apart): undecided, since nothing bounds when the server processed
+    # the hint. A hint the record bounds only by an interval: sip while even
+    # its earliest arrival is under 30 s before the initiation was processed,
+    # undecided when it reaches further back. A clock step: undecided.
+    layout = NARROW
+    at = 5300 if case in ("timing-paused", "timing-untimed") else 2300
+    if case in ("timing-untimed", "timing-untimed-fresh"):
+        lines.append("1990~%d %s 41006 %d %s" % (at - 1, A, len(SIP_HINT), SIP_HINT.hex()))
+    else:
+        add(2000, SIP_HINT)
+    sequence(at, [initiation(), transport()])
+    if case == "timing-step":
+        lines.append("2310 - clock-step 2250")
+    est = [(at - 10, at + 40)]
+    window = (at - 20, at + 1000)
+elif case == "malformed":
+    # A frame whose datagram is unknown, while it could have been the hint.
+    sequence(2000, [SIP_HINT, initiation(), transport()])
+    lines.insert(1, "2000 %s - malformed 28 4500001c" % A)
+elif case == "malformed-other-address":
+    sequence(2000, [SIP_HINT, initiation(), transport()])
+    lines.insert(1, "2000 %s - malformed 28 4500001c" % OTHER)
+elif case == "malformed-early":
+    # Long before the client: its port, and so whether it holds a session of
+    # this peer or a hint, is unknown: undecided.
+    lines.append("1600 %s - malformed 28 4500001c" % A)
+    sequence(4800, [SIP_HINT, initiation(), transport()])
+    est = [(4790, 4840)]
+elif case == "malformed-after-pin":
+    sequence(2000, [SIP_HINT, initiation(), transport()])
+    lines.append("2500 %s - malformed 28 4500001c" % A)
+elif case == "drops-during":
+    sequence(2000, [SIP_HINT, initiation(), transport()])
+    lines.insert(1, "2000 - drops 3 1990")
+elif case == "fragment":
+    sequence(2000, [SIP_HINT, initiation(), transport()])
+    lines.insert(1, "2000 %s 41006 fragment 1400" % A)
+elif case == "fragment-other-port":
+    sequence(2000, [SIP_HINT, initiation(), transport()])
+    lines.insert(1, "2000 %s 41007 fragment 1400" % A)
+elif case == "late-record":
+    ready = 2500
+    sequence(3000, [SIP_HINT, initiation(), transport()])
+    est = [(2995, 3040)]
+elif case == "straddles-epoch":
+    lines.append("1400~1600 %s 41006 %d %s" % (A, len(SIP_HINT), SIP_HINT.hex()))
+    sequence(2000, [initiation(), transport()])
+elif case in ("retry", "retry-window-after"):
+    # An initiation without a hint, then a SIP hint and a second initiation,
+    # then the client's ping. Either may be the one the server answered: if
+    # only the first, random; if the second, sip: undecided, also over a
+    # window after the ping.
+    sequence(2000, [initiation()])
+    sequence(2600, [SIP_HINT, initiation(), transport()])
+    est = [(1995, 2640)]
+    if case == "retry-window-after":
+        window = (2700, 20000)
+elif case == "no-establishment":
+    # Without the client's evidence nothing bounds when anything was
+    # processed, or whether the initiation was accepted.
+    sequence(2000, [SIP_HINT, initiation(), transport()])
+    est = []
+elif case in ("connected-after-window", "connected-covering-window", "connected-before-epoch",
+              "connected-before-initiation", "connected-in-window"):
+    # Finding 4 of the fourth review: a socket connected to the client, seen
+    # at CONNECTED, shows an acceptance of an initiation that arrived after
+    # the epoch, no later than CONNECTED; not one inside an earlier window.
+    # A mac1-consistent initiation with a DNS-query prefix at 2000, a plain
+    # one at 3000, no establishment, the window 2100-2500:
+    #   seen at 3100: the acceptance may be the one at 3000, and nothing was
+    #     accepted in the window: undecided (the earlier model forced the
+    #     forgery accepted: dns); the same over a window covering 3000;
+    #   seen at 1400, before the epoch (1500): no evidence about this server;
+    #   seen at 1900 with only the DNS one: no initiation before it, a
+    #     contradiction: undecided;
+    #   seen at 2300 with only the DNS one: it was accepted by then: dns.
+    layout = NARROW
+    query = bytes([0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]) + b"\x16" + b"a" * 22 + b"\x00\x00\x01\x00\x01"
+    add(2000, initiation(prefix=query))
+    if case in ("connected-after-window", "connected-covering-window"):
+        add(3000, initiation())
+    est = []
+    connected = {"connected-after-window": "3100", "connected-covering-window": "3100", "connected-before-epoch": "1400",
+                 "connected-before-initiation": "1900", "connected-in-window": "2300"}[case]
+    window = (3100, 3500) if case == "connected-covering-window" else (2100, 2500)
+elif case in ("watch-not-ended", "watch-ended-early"):
+    # The watch must end with its final collection; where it ended, nothing
+    # after is covered. A SIP hint, then the client.
+    layout = NARROW
+    add(2000, SIP_HINT)
+    sequence(2030, [initiation(), transport()])
+    est = [(2025, 2060)]
+    if case == "watch-not-ended":
+        watch_end = False
+    else:
+        lines.append("2050 - delivery-end 1998")
+elif case in ("no-acceptance-evidence", "connected-acceptance", "establishment-elsewhere"):
+    # Finding 5 of the third review: a lone initiation candidate, its mac1
+    # consistent with the server's key (anyone can compute one) and its S1
+    # prefix a DNS query. Nothing shows that the server accepted it; if it
+    # accepted none, it selected nothing, and the outcome is undecided, not
+    # dns and not random. A socket connected to the client's endpoint shows
+    # an acceptance: dns. An establishment no initiation fits contradicts
+    # the record: undecided.
+    layout = NARROW
+    query = bytes([0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]) + b"\x16" + b"a" * 22 + b"\x00\x00\x01\x00\x01"
+    sequence(2000, [initiation(prefix=query)])
+    est = {"no-acceptance-evidence": [], "connected-acceptance": [], "establishment-elsewhere": [(3000, 3100)]}[case]
+    if case == "connected-acceptance":
+        connected = "2100"
+    window = (2100, 2500)
+elif case in ("delivery-any", "delivery-endpoint", "delivery-unknown", "delivery-other-endpoint", "delivery-after-pin",
+              "delivery-initiation", "unwatched"):
+    # Finding 2 of the third review: a complete record shows what reached
+    # the namespace, not the server's socket. A SIP hint, then the client.
+    # A loss the watch reports for any endpoint, for this one, or unknown,
+    # while the hint arrived: it may never have reached the server (whose
+    # sockets, in the review, dropped 4780 datagrams while the record lost
+    # none): undecided. A loss for another endpoint, after the selection
+    # was pinned, or only around the initiation (a lost initiation is one
+    # not accepted, already a history): sip. A record that did not watch:
+    # undecided.
+    layout = NARROW
+    add(2000, SIP_HINT)
+    sequence(2030, [initiation(), transport()])
+    est = [(2025, 2060)]
+    lines.append({"delivery-any": "2002 - delivery 4780 1999 any",
+                  "delivery-endpoint": "2002 - delivery 1 1999 %s:41006" % A,
+                  "delivery-unknown": "2002 - delivery unknown 1999 any",
+                  "delivery-other-endpoint": "2002 - delivery 9 1999 %s:41007" % A,
+                  "delivery-after-pin": "2200 - delivery 3 2100 any",
+                  "delivery-initiation": "2032 - delivery 1 2029 any",
+                  "unwatched": None}[case] or "2001 %s 41007 2 abcd" % A)
+    watched = case != "unwatched"
+elif case == "poll-gap-hidden":
+    # Finding 4 of the third review: a session (a STUN hint and an
+    # initiation) whose frames the record's socket dropped at 19.2 s, after
+    # the counters reset at 19 s, while the recorder was preempted until 21
+    # s before its next clock reading; then a SIP hint and the client. The
+    # drops line comes from the recorder's own poll on the review's scripted
+    # counters and clocks: it must reach back to 19 s, where the hidden
+    # session may have pinned the peer: undecided (the earlier recorder
+    # reported 21 s to 23 s, which looked like after the pin: sip).
+    layout = NARROW
+    class Clock:
+        def __init__(self):
+            self.ns = 1900 * 10 ** 7
+        def sample(self):
+            return wire.ClockSample(self.ns, 10 ** 15, 0, 0)
+        def boot(self):
+            return self.ns
+    class Counters:
+        def __init__(self, clock):
+            self.clock, self.count = clock, 0
+        def drops(self):
+            self.count += 1
+            if self.count == 1:
+                self.clock.ns = 2100 * 10 ** 7
+                return 0
+            return 2
+    clock, marker = Clock(), io.StringIO()
+    recorder = wire.Recorder(Counters(clock), clock, marker, {bytes([192, 0, 2, 2])}, None, 51998, clock.sample())
+    recorder.poll()
+    clock.ns = 2300 * 10 ** 7
+    recorder.poll()
+    add(2000, SIP_HINT)
+    sequence(2010, [initiation(), transport()])
+    lines.append(marker.getvalue().strip())
+    window = (2100, 2500)
+else:
+    raise SystemExit("no case " + case)
+if watched:
+    lines.insert(0, "%d - delivery-watch 51998" % ready)
+    # The watch's final collection, after every window these cases use,
+    # unless a case ends it earlier or not at all.
+    if not any(" - delivery-end " in line for line in lines) and watch_end:
+        lines.append("99990 - delivery-end 99980")
+# Complete through a cutoff after every window these cases use.
+lines.append("99999 - complete 99998")
+with open(path, "w") as out:
+    out.write("".join(line + "\n" for line in lines))
+with open(path + ".state", "w") as state:
+    state.write("ready 1 1 %d\nstopped %d %s\n" % (ready, len(lines), "0" * 32))
+args = sys.argv[5:]
+if args:
+    epoch, window = int(args[0]), (int(args[1]), int(args[2]))
+argv = ["auto-expect", path, A, "41006", layout, base64.b64encode(SERVER).decode(), path + ".hp" if hp else "-", "off",
+        str(epoch), str(window[0]), str(window[1]), ",".join("%d:%d" % pair for pair in est) or "-", connected]
+buffer = io.StringIO()
+with contextlib.redirect_stdout(buffer):
+    status = wire.main(argv)
+print("%d %s" % (status, buffer.getvalue().splitlines()[-1] if buffer.getvalue() else "-"))
+PY
+}
+for CASE in "stun-colliding|0 expect random" "stun-clear|0 expect stun" "other-port|0 expect random" \
+	"other-address|0 expect random" "age-28|0 expect sip" "first-hint-wins|0 expect quic" "from-initiation|0 expect dns" \
+	"hp-sip-large|0 expect random" "hp-sip-small|0 expect sip" "policy-retry-connected|0 expect dns" \
+	"gap-full|0 expect stun" "gap-before-epoch|0 expect stun" "gap-after-pin|0 expect stun" "timing-fresh|0 expect sip" "timing-untimed-fresh|0 expect sip" \
+	"malformed-other-address|0 expect sip" "malformed-after-pin|0 expect sip" "fragment-other-port|0 expect sip" \
+	"connected-acceptance|0 expect dns" "connected-in-window|0 expect dns" "delivery-other-endpoint|0 expect sip" \
+	"delivery-after-pin|0 expect sip" \
+	"delivery-initiation|0 expect sip"; do
+	assert_eq "${CASE#*|}" "$(auto_case "${CASE%%|*}" 2>&1)" "auto-expect, ${CASE%%|*}: ${CASE#*|}"
+done
+for CASE in age-30 age-32 hp-unmasked-initiation no-initiation policy-retry forgery gap-hidden timing-paused timing-untimed \
+	timing-step malformed malformed-early drops-during fragment late-record straddles-epoch retry retry-window-after \
+	no-establishment no-acceptance-evidence establishment-elsewhere delivery-any delivery-endpoint delivery-unknown unwatched \
+	poll-gap-hidden connected-after-window connected-covering-window connected-before-epoch connected-before-initiation \
+	watch-not-ended watch-ended-early; do
+	GOT="$(auto_case "${CASE}" 2>&1)"
+	assert_true "auto-expect, ${CASE}: undecided, exit 1, never a guess (${GOT})" bash -c '[[ "$1" == "1 undecided "* ]]' _ "${GOT}"
+done
+# The reasons the third review's cases are undecided for: the evidence each
+# lacks, not a format the record no longer has.
+for CASE in "connected-after-window|no initiation accepted by the window's end" \
+	"connected-before-epoch|the connected socket was seen at 1400, before the server's state was last empty at 1500" \
+	"connected-before-initiation|no history agrees with the establishments [(1500, 1900)]" \
+	"watch-not-ended|the record's delivery watch did not end with its final collection" \
+	"watch-ended-early|the hint #1 (2000~2001) may not have reached the server: the delivery watch covers nothing from 1998 on" \
+	"no-acceptance-evidence|nothing shows that the server accepted any of this client's initiations" \
+	"no-establishment|nothing shows that the server accepted any of this client's initiations" \
+	"establishment-elsewhere|no history agrees with the establishments" \
+	"delivery-any|the hint #1 (2000~2001) may not have reached the server: the server's sockets lost 4780 datagrams from anyone" \
+	"delivery-endpoint|the hint #1 (2000~2001) may not have reached the server: the server's sockets lost 1 datagrams from 192.0.2.2:41006" \
+	"delivery-unknown|the hint #1 (2000~2001) may not have reached the server: the server's sockets lost unknown datagrams" \
+	"unwatched|the record did not watch delivery to the server's UDP sockets" \
+	"poll-gap-hidden|2 frames the record dropped between 1900 and 2300, before the selection was certainly pinned"; do
+	GOT="$(auto_case "${CASE%%|*}" 2>&1)"
+	assert_true "auto-expect, ${CASE%%|*}: undecided because ${CASE#*|} (${GOT})" \
+		bash -c '[[ "$1" == "1 undecided $2"* ]]' _ "${GOT}" "${CASE#*|}"
+done
+# Establishment evidence that is not well formed is refused, not read as
+# none.
+auto_case from-initiation >/dev/null 2>&1
+for EST in "2040:1995" "1995" "x:2040" "1995:2040,"; do
+	GOT="$("${REAL_PYTHON}" "${WIRE_REAL}" auto-expect "${T}/auto-record" 192.0.2.2 41006 \
+		"40,40,40,40,100000001-100000100,200000001-200000100,300000001-300000100,400000001-400000100" \
+		"$("${REAL_PYTHON}" -c 'import base64; print(base64.b64encode(bytes(range(32, 64))).decode())')" - off 1500 1900 20000 "${EST}" - 2>&1)"
+	assert_true "auto-expect refuses the establishments '${EST}' (${GOT})" bash -c '[[ "$1" == "ERROR: "* ]]' _ "${GOT}"
+done
+GOT="$(auto_case stun-clear 1500 1900 1950 2>&1)"
+assert_true "auto-expect, a window that ends before any initiation: undecided (${GOT})" \
+	bash -c '[[ "$1" == "1 undecided no initiation"* ]]' _ "${GOT}"
+printf '1000 192.0.2.2 41006 3 abcd\n' >"${T}/bad-record"
+printf 'ready 1 1 900\nstopped 1 %s\n' "$(printf '0%.0s' {1..32})" >"${T}/bad-record.state"
+"${REAL_PYTHON}" "${WIRE_REAL}" auto-expect "${T}/bad-record" 192.0.2.2 41006 "${STUN_CLEAR}" "${FIXTURE_KEY}" - off 1000 1000 2000 >/dev/null 2>&1
+assert_eq 1 "$?" "auto-expect refuses a record whose length is not that of its bytes"
+printf '1000 192.0.2.2 41006 2 abcd\n3000 - complete 2999\n1001 192.0.2.2 41006 2 abcd\n' >"${T}/bad-record"
+printf 'ready 1 1 900\nstopped 3 %s\n' "$(printf '0%.0s' {1..32})" >"${T}/bad-record.state"
+"${REAL_PYTHON}" "${WIRE_REAL}" auto-expect "${T}/bad-record" 192.0.2.2 41006 "${STUN_CLEAR}" "${FIXTURE_KEY}" - off 1000 1000 2000 >/dev/null 2>&1
+assert_eq 1 "$?" "auto-expect refuses a record with a line after its end marker"
+for END in "" "3000 - incomplete 2999" "1900 - complete 1899"; do
+	{ printf '1000 192.0.2.2 41006 2 abcd\n'; [[ -z "${END}" ]] || printf '%s\n' "${END}"; } >"${T}/bad-record"
+	printf 'ready 1 1 900\nstopped %d %s\n' "$((${END:+1} + 1))" "$(printf '0%.0s' {1..32})" >"${T}/bad-record.state"
+	GOT="$("${REAL_PYTHON}" "${WIRE_REAL}" auto-expect "${T}/bad-record" 192.0.2.2 41006 "${STUN_CLEAR}" "${FIXTURE_KEY}" - off 1000 1000 2000 2>&1)"
+	assert_true "auto-expect: a record ${END:+ending '${END}'}${END:-without an end marker} is not complete through the window: undecided (${GOT##*$'\n'})" \
+		bash -c '[[ "$1" == "undecided the record is not complete through"* ]]' _ "${GOT##*$'\n'}"
+done
+printf '1000 192.0.2.2 41006 2 abcd\n' >"${T}/bad-record"
+printf 'ready 1 1 900\nstopped 2 %s\n' "$(printf '0%.0s' {1..32})" >"${T}/bad-record.state"
+"${REAL_PYTHON}" "${WIRE_REAL}" auto-expect "${T}/bad-record" 192.0.2.2 41006 "${STUN_CLEAR}" "${FIXTURE_KEY}" - off 1000 1000 2000 >/dev/null 2>&1
+assert_eq 1 "$?" "auto-expect refuses a record whose transcript does not count its records"
+printf 'ready 1 1 900\n' >"${T}/bad-record.state"
+"${REAL_PYTHON}" "${WIRE_REAL}" auto-expect "${T}/bad-record" 192.0.2.2 41006 "${STUN_CLEAR}" "${FIXTURE_KEY}" - off 1000 1000 2000 >/dev/null 2>&1
+assert_eq 1 "$?" "auto-expect refuses a record that has not ended"
+echo "=== The record's completeness and arrival times (Recorder, on a scripted socket and clocks) ==="
+# The packet socket and the clocks are scripted (py recorder); the record's
+# core is the helper's own. The socket's clock is 100 s after boot when it is
+# created; frames come from 192.0.2.1 to port 40000.
+for CASE in delayed-ready queued-at-stop dequeue-delay no-stamp clock-step suspend endless wide-after wide-empty straddle \
+	narrow-boundary poll-preempted begin-preempted finish-preempted delivery-quiet delivery-listener delivery-connected \
+	delivery-new-socket delivery-reconnected delivery-retired delivery-unseen delivery-other-port delivery-namespace \
+	delivery-dump-fails delivery-events-lost delivery-unavailable delivery-during-dump delivery-final-dump \
+	delivery-final-last-dump delivery-final-settle delivery-slow-notifications delivery-final-failed-last-dump \
+	delivery-dump-fails-pending delivery-canary-port-reuse capture-queued capture-drops capture-endless; do
+	py recorder "${CASE}" >"${T}/recorder-${CASE}" 2>&1
+done
+# "<from>~<to>" or "<clock>" of the frame line (4 payload bytes) in a
+# recorder case, and the value of one of its "<name>-cs <clock>" lines.
+arrival_of() { awk '$2 == "192.0.2.1" && $5 == "<4" { print $1; exit }' "${T}/recorder-$1"; }
+cs_of() { awk -v name="$2-cs" '$1 == name { print $2; exit }' "${T}/recorder-$1"; }
+# Whether ARRIVAL is an interval that holds CLOCK and is at least WIDTH wide.
+interval_holds() { # <arrival> <clock> <width>
+	[[ "$1" =~ ^([0-9]+)~([0-9]+)$ ]] && ((BASH_REMATCH[1] <= $2 && $2 <= BASH_REMATCH[2] && BASH_REMATCH[2] - BASH_REMATCH[1] >= $3))
+}
+for CASE in wide-after wide-empty; do
+	assert_true "a reading preempted 3 s between its realtime reads (${CASE#wide-}): the arrival is an interval that holds the true one ($(cs_of "${CASE}" arrived)), not an exact stamp ($(arrival_of "${CASE}"))" \
+		interval_holds "$(arrival_of "${CASE}")" "$(cs_of "${CASE}" arrived)" 100
+done
+assert_true "a stamp 1 ms past a centisecond, read with 6 ms brackets: an interval across the boundary ($(arrival_of straddle))" \
+	interval_holds "$(arrival_of straddle)" "$(cs_of straddle arrived)" 2
+assert_eq "$(cs_of narrow-boundary arrived)" "$(arrival_of narrow-boundary)" "  with exact readings, that centisecond"
+for CASE in poll-preempted begin-preempted finish-preempted; do
+	MARKER="$(grep -E '^[0-9]+ - drops 993 [0-9]+$' "${T}/recorder-${CASE}")"
+	assert_true "counters reset and the recorder preempted 2 s before its next reading (${CASE%-preempted}): the drops line's interval (${MARKER}) begins before the reset ($(cs_of "${CASE}" reset)) and holds the loss ($(cs_of "${CASE}" lost))" \
+		bash -c 'read -r CLOCK _ _ _ SINCE <<<"$1"; [[ -n "${CLOCK}" ]] && ((SINCE <= $2 && $2 <= $3 && $3 <= CLOCK))' _ \
+		"${MARKER}" "$(cs_of "${CASE}" reset)" "$(cs_of "${CASE}" lost)"
+done
+# A delivery case's loss lines, "<count> <since> <peer>" with SINCE as
+# "watch" (the watch's start) or "poll" (the poll before).
+delivery_lines() { # <case>
+	awk -v watch="$(cs_of "$1" watch)" '$2 == "-" && $3 == "delivery" { print $4, ($5 == watch ? "watch" : "poll"), $6 }' "${T}/recorder-$1"
+}
+assert_true "the delivery watch is the record's first line, on the record's port" \
+	bash -c '[[ "$(sed -n "/^ready /{n;p}" "$1")" =~ ^[0-9]+\ -\ delivery-watch\ 40000$ ]]' _ "${T}/recorder-delivery-quiet"
+assert_eq "" "$(delivery_lines delivery-quiet)" "  with nothing lost, no loss is reported"
+assert_eq "5 poll any" "$(delivery_lines delivery-listener)" "a listener's drops are losses for any endpoint, since the poll before"
+assert_eq "3 poll 192.0.2.1:51820" "$(delivery_lines delivery-connected)" "a connected socket's drops are its endpoint's"
+assert_eq "2 poll any" "$(delivery_lines delivery-new-socket)" "a socket first seen with drops may have taken them before it was connected: any"
+assert_eq "4 poll any" "$(delivery_lines delivery-reconnected)" "  as may one connected since the last reading"
+assert_eq "unknown poll 192.0.2.1:51820" "$(delivery_lines delivery-retired)" \
+	"a socket gone since the last reading may have lost its endpoint's datagrams after it: unknown"
+assert_eq "unknown watch any" "$(delivery_lines delivery-unseen)" \
+	"a socket on the port destroyed before any reading saw it: unknown since the watch began, for any endpoint (connected to the client when destroyed, it may have taken anyone's datagrams before)"
+assert_eq "" "$(delivery_lines delivery-other-port)" "  one on another port is not the server's"
+assert_eq "4 poll any" "$(delivery_lines delivery-namespace)" "datagrams the namespace dropped before any socket are losses for any endpoint"
+assert_eq "unknown poll any" "$(delivery_lines delivery-dump-fails)" "a reading that fails leaves the interval unknown"
+assert_eq "unknown watch any" "$(delivery_lines delivery-events-lost)" "lost destruction notifications leave everything since the watch began unknown"
+assert_true "without notifications the record does not watch: no watch line, no loss lines" \
+	bash -c '! grep -q " - delivery" "$1"' _ "${T}/recorder-delivery-unavailable"
+assert_eq "unknown watch any" "$(delivery_lines delivery-during-dump)" \
+	"a destruction notified while a reading's dump runs is reconciled by that reading"
+# The final collection (finish): whenever an unseen socket's destruction is
+# notified -- during its first dump, while it waits, during its last dump --
+# it reaches the record before the end marker; a canary not notified in time
+# leaves everything unknown; and the watch's end marker follows the cutoff.
+for CASE in delivery-final-dump delivery-final-settle delivery-final-last-dump; do
+	assert_eq "unknown watch any" "$(delivery_lines "${CASE}")" \
+		"final collection, notified ${CASE#delivery-final-}: the unseen socket's lifetime is unknown, for any endpoint"
+done
+assert_eq "unknown watch any" "$(delivery_lines delivery-slow-notifications)" \
+	"final collection: a canary whose destruction is not notified in time leaves everything since the watch began unknown"
+assert_eq "" "$(delivery_lines delivery-quiet)" "  and a clean final collection reports nothing"
+# The fifth review: notifications received before a failed last dump still
+# reach the record (the unseen socket's whole life, and, the last reading
+# having failed, everything since the watch began); in a regular poll, the
+# failed reading reports the unseen socket at once, and the next one does not
+# repeat or drop it. The canary is set aside by its cookie alone: given the
+# watched port, it leaves the server socket's notification in place.
+assert_eq "unknown poll any
+unknown watch any
+unknown watch any" "$(delivery_lines delivery-final-failed-last-dump)" \
+	"final collection, its last dump failing after an unseen socket's destruction was notified: unknown since the watch began"
+assert_eq "unknown poll any
+unknown watch any" "$(delivery_lines delivery-dump-fails-pending)" \
+	"a failed regular dump reports an unseen socket notified during it, once"
+assert_eq "unknown watch any" "$(delivery_lines delivery-canary-port-reuse)" \
+	"a canary given the watched port sets aside only its own notification (by cookie): the server socket's stays"
+for CASE in delivery-quiet delivery-final-dump delivery-slow-notifications; do
+	assert_true "the watch ends with delivery-end, just before the end marker, from a time after the cutoff (${CASE})" \
+		bash -c 'END="$(tail -n 2 "$1" | head -n 1)"; [[ "${END}" =~ ^[0-9]+\ -\ delivery-end\ ([0-9]+)$ ]] && ((BASH_REMATCH[1] >= $2))' _ \
+		"${T}/recorder-${CASE}" "$(cs_of "${CASE}" cutoff)"
+done
+assert_eq "capture records 23 losses 0 complete True" "$(grep '^capture ' "${T}/recorder-capture-queued")" \
+	"capture's records: the 22 good and the 1 bad datagram queued at the stop are all drained and recorded"
+assert_eq "capture records 23 losses 3 complete True" "$(grep '^capture ' "${T}/recorder-capture-drops")" \
+	"  its packet socket's drops are counted"
+assert_true "  and a drain that cannot finish says so ($(grep '^capture ' "${T}/recorder-capture-endless"))" \
+	bash -c 'grep -q "^capture records [0-9]* losses 0 complete False$" "$1"' _ "${T}/recorder-capture-endless"
+assert_true "the drop counters' baseline comes before readiness: 993 drops after it, before the first poll, are reported, the 7 before the record existed are not ($(grep -c ' drops ' "${T}/recorder-delayed-ready"))" \
+	bash -c 'grep -qE "^[0-9]+ - drops 993 [0-9]+$" "$1" && ! grep -q " drops 7 " "$1" && [[ "$(tail -n 1 "$1")" =~ \ -\ complete\ [0-9]+$ ]]' _ "${T}/recorder-delayed-ready"
+assert_true "a stop drains the queue: all 50 queued frames are recorded before the complete marker ($(grep -c '<3 bytes>' "${T}/recorder-queued-at-stop"))" \
+	bash -c '[[ "$(grep -c "<3 bytes>" "$1")" == 50 && "$(tail -n 1 "$1")" =~ \ -\ complete\ [0-9]+$ ]]' _ "${T}/recorder-queued-at-stop"
+assert_true "a frame read 2.2 s after it arrived is recorded at its kernel arrival time, not when it was read ($(grep arrival-error "${T}/recorder-dequeue-delay"))" \
+	bash -c 'grep -qx "arrival-error-cs 0" "$1"' _ "${T}/recorder-dequeue-delay"
+assert_true "a frame without a kernel stamp is recorded with the interval it must have arrived in ($(grep '<4 bytes>' "${T}/recorder-no-stamp"))" \
+	bash -c 'grep -qE "^[0-9]+~[0-9]+ 192\.0\.2\.1 51820 4 <4 bytes>$" "$1"' _ "${T}/recorder-no-stamp"
+assert_true "a realtime step while a frame waits: its stamp converts under either offset, an interval, and the step is marked ($(grep -c clock-step "${T}/recorder-clock-step"))" \
+	bash -c 'grep -qE "^[0-9]+~[0-9]+ 192\.0\.2\.1 51820 4 <4 bytes>$" "$1" && grep -qE "^[0-9]+ - clock-step [0-9]+$" "$1"' _ "${T}/recorder-clock-step"
+assert_true "a suspend (boottime moving against monotonic, the server's clock) is marked as a clock step" \
+	bash -c 'grep -qE "^[0-9]+ - clock-step [0-9]+$" "$1"' _ "${T}/recorder-suspend"
+assert_true "traffic that never lets the queue empty: the drain gives up within its budget and the record ends incomplete ($(tail -n 1 "${T}/recorder-endless"))" \
+	bash -c '[[ "$(tail -n 1 "$1")" =~ \ -\ incomplete\ [0-9]+$ ]]' _ "${T}/recorder-endless"
+
+echo "=== The delivery watch's netlink decoder (decoder fault injections) ==="
+# Raw sock_diag replies and notifications scripted here, through a stand-in
+# for the kernel's socket: the decoder's own error paths, not replies seen in
+# the live runs. Only a dump that completes with status 0 is a snapshot; an
+# empty table is one.
+assert_eq "{}" "$(py netlink dump-empty 2>&1)" "a completed dump of no socket is an empty snapshot"
+assert_eq "{1: ('any', 0)}" "$(py netlink dump-listener 2>&1)" "a completed dump of the listener"
+assert_eq "{1: ('any', 0)}" "$(py netlink dump-two-datagrams 2>&1)" "  also across two datagrams"
+for CASE in dump-interrupted dump-interrupted-socket dump-failed-completion dump-completion-without-status dump-error \
+	dump-error-zero dump-no-completion dump-after-completion dump-other-sequence dump-not-multipart dump-other-family \
+	dump-no-drop-counter dump-bad-attribute dump-short-socket dump-truncated dump-trailing-bytes dump-overrun dump-unknown-type; do
+	GOT="$(py netlink "${CASE}" 2>&1)"
+	assert_true "a dump reply ${CASE#dump-} is no snapshot (${GOT})" bash -c '[[ "$1" == "refused: "* ]]' _ "${GOT}"
+done
+assert_eq "[]" "$(py netlink events-none 2>&1)" "no notification pending: none"
+assert_eq "[(9, 51998, 'any')]" "$(py netlink events-one 2>&1)" "a destruction notification"
+for CASE in events-overrun events-error events-short events-truncated events-short-socket events-empty-datagram; do
+	GOT="$(py netlink "${CASE}" 2>&1)"
+	assert_true "notifications ${CASE#events-}: refused, so the watch counts them as lost (${GOT})" bash -c '[[ "$1" == "refused: "* ]]' _ "${GOT}"
+done
+# The same faults through the watch, the record and auto-expect: a SIP hint
+# and an initiation the client's ping establishes; the fault hits the
+# reading after the hint. Clean, the record decides sip; with any fault it
+# reaches the record (no watch, or an unknown loss) and nothing is decided.
+GOT="$(py rawwatch raw-clean "${T}" 2>&1)"
+assert_true "raw replies, no fault: the record decides sip ($(tail -n 1 <<<"${GOT}"))" \
+	bash -c '[[ "$(tail -n 1 <<<"$1")" == "0 expect sip" && "$1" == *" - delivery-watch 51998"* && "$1" != *" - delivery unknown"* ]]' _ "${GOT}"
+GOT="$(py rawwatch raw-begin-failed "${T}" 2>&1)"
+assert_true "a failed baseline dump: the record does not watch, and decides nothing ($(tail -n 1 <<<"${GOT}"))" \
+	bash -c '[[ "$(tail -n 1 <<<"$1")" == "1 undecided the record did not watch delivery"* && "$1" != *"delivery-watch"* ]]' _ "${GOT}"
+for CASE in raw-dump-interrupted raw-dump-failed raw-dump-error raw-dump-truncated raw-dump-other-sequence \
+	raw-notification-overrun raw-notification-short; do
+	GOT="$(py rawwatch "${CASE}" "${T}" 2>&1)"
+	assert_true "${CASE#raw-}: an unknown loss reaches the record, and the hint is not trusted ($(tail -n 1 <<<"${GOT}"))" \
+		bash -c '[[ "$1" == *" - delivery unknown "*" any"* && "$(tail -n 1 <<<"$1")" == "1 undecided the hint #1 "* ]]' _ "${GOT}"
+done
 
 echo "=== IPv4/UDP framing before payload ==="
 assert_eq "datagram 77 77 whole" "$(py frame valid)" "a valid frame yields its UDP payload"
@@ -1226,6 +2501,81 @@ for KINDS_MODE in empty garbage; do
 	expect_fixture "a scenario whose helper exits 0 with ${KINDS_MODE} output is rejected" reject \
 		"the capture has a complete, valid per-kind result" live_case "${T}/live-valid" FAKE_KINDS="${KINDS_MODE}"
 done
+
+echo "=== The auto hint test's scenarios: planting and stale evidence (tests/test-boringtun-auto-hint-live.sh) ==="
+# Its scenario runner, extracted verbatim, with every external step stubbed
+# to succeed except the one a case breaks. Planting counts only with exit
+# status 0 and exactly the report its kind gives; a scenario that did not run
+# to the end is never judged, so no earlier scenario's files can stand in for
+# its evidence.
+HINT_LIVE="${SCRIPT_DIR}/test-boringtun-auto-hint-live.sh"
+for FUNCTION in run_scenario scenario plant_ok plant_expected capture_format; do
+	assert_true "${FUNCTION} is extracted from test-boringtun-auto-hint-live.sh" test -n "$(extract "${HINT_LIVE}" "${FUNCTION}")"
+done
+hint_case() { # [VAR=value...]: FIX_SENT, FIX_RC, FIX_SETUP, FIX_ORACLE, FIX_STALE
+	# shellcheck disable=SC2034 # the fixture settings are read by the extracted functions
+	(
+		# shellcheck disable=SC2163 # the arguments are VAR=value assignments
+		export FIX_SENT="sent 27" FIX_RC=0 FIX_SETUP=0 FIX_ORACLE="expect sip" FIX_STALE="" "$@"
+		WORK="${T}/hint-work"
+		rm -rf "${WORK}" && mkdir -p "${WORK}"
+		NS_S=fixture NS_C=fixture VETH_S=fixture VETH_C=fixture IF_C=fixture ADDR_S=203.0.113.1 ADDR_C=203.0.113.2
+		PORT=51998 CLIENT_PORT=41006 TUN_S=10.78.0.1 TUN_C=10.78.0.2 CAPTURE_SECONDS=12 S_SIZES=27,113,125,37 H_RANGES="${H}"
+		SERVER_PUB="${FIXTURE_KEY}" CLIENT_PUB="${FIXTURE_KEY}" STUN_PRELUDE="${PRELUDES}/stun.hex" EXPECT=""
+		PASSED=0 FAILED=0
+		ok() { echo "  OK: $1"; PASSED=$((PASSED + 1)); }
+		bad() { echo "  FAIL: $1"; FAILED=$((FAILED + 1)); }
+		check() { local M="$1"; shift; if "$@"; then ok "${M}"; else bad "${M}"; fi; }
+		setup() { return "${FIX_SETUP}"; }
+		start_server() { EPOCH=101; }
+		sleep() { :; }
+		wait_for() { shift; "$@"; }
+		tunnel_ping() { :; }
+		start_peer() { :; }
+		ip() { :; }
+		tunnel_up() { :; }
+		bt_wire_capture_start() { BT_WIRE_CAPTURE_READY_CLOCK=100; echo fresh >"$6"; }
+		bt_wire_capture_park() { :; }
+		bt_wire_capture_resume() { :; }
+		bt_wire_capture_finish() { :; }
+		bt_wire_now() { BT_WIRE_NOW=200; }
+		plant() { printf '%s\n' "${FIX_SENT}"; return "${FIX_RC}"; }
+		python3() { if [[ "$2" == auto-expect ]]; then echo "${FIX_ORACLE}"; else command python3 "$@"; fi; }
+		judge() { echo "  JUDGED $1 from: $(cat "${WORK}/$1.capture")"; ok "the stand-in judge ran"; }
+		for FUNCTION in run_scenario scenario plant_ok plant_expected capture_format; do
+			eval "$(extract "${HINT_LIVE}" "${FUNCTION}")"
+		done
+		[[ -z "${FIX_STALE}" ]] || printf 'STALE\n' | tee "${WORK}/hint.capture" "${WORK}/hint.expect" "${WORK}/hint.format" >/dev/null
+		if declare -F scenario >/dev/null; then
+			scenario hint hint 0 none sip
+		else
+			run_scenario hint hint 0
+		fi
+		echo "complete assertions=$((PASSED + FAILED)) failures=${FAILED}"
+		((FAILED == 0))
+	)
+}
+expect_fixture "a planted hint sent with exit 0 and the report 'sent 27' counts, and the scenario is judged" pass - hint_case
+expect_fixture "planting that reports 'sent 27' but exits 1 fails the scenario" reject "sent from 203.0.113.2:41006 (exit 1, 'sent 27'" \
+	hint_case FIX_RC=1
+for REPORT in "sent 28" "sent 27 more" "sent 27:" ""; do
+	expect_fixture "planting that exits 0 but reports '${REPORT}' fails the scenario" reject "sent from 203.0.113.2:41006 (exit 0, '${REPORT}'" \
+		hint_case FIX_SENT="${REPORT}"
+done
+expect_fixture "a record that decides nothing fails the scenario" reject "decides what it selected for the client (undecided" \
+	hint_case FIX_ORACLE="undecided no initiation from this client was recorded by the end of the window"
+for CASE in "FIX_RC=1|planting failed" "FIX_SETUP=1|the setup failed" "FIX_ORACLE=undecided x|the record decided nothing"; do
+	OUTPUT="$(hint_case FIX_STALE=1 "${CASE%%|*}" 2>&1)"
+	assert_true "when ${CASE#*|}, an earlier scenario's files are removed and nothing is judged" \
+		bash -c '[[ "$1" != *JUDGED* && "$1" == *"none of its evidence is judged"* ]] && ! grep -qs STALE "$2"/hint.expect "$2"/hint.format "$2"/hint.capture' \
+		_ "${OUTPUT}" "${T}/hint-work"
+done
+assert_eq "sent 5: 104 108 95 57 95" "$(
+	# shellcheck disable=SC2034 # read by the extracted plant_expected
+	STUN_PRELUDE="${PRELUDES}/stun.hex"
+	eval "$(extract "${HINT_LIVE}" plant_expected)"
+	plant_expected stun-sequence
+)" "the recorded STUN sequence is planted only with the report of all five datagrams, in order"
 
 echo "=== The fixture judge itself ==="
 crashing_fixture() {

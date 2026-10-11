@@ -286,9 +286,24 @@ bt_wire_show() { # <label> <file>
 # and collected. A layout comes with the receiving peer's public key, under
 # which the helper checks MAC1 consistency when a complete datagram fits
 # more than one packet kind (its Evidence: MAC1 consistency and
-# receiver-index correlation, not authentication).
+# receiver-index correlation, not authentication). With BT_WIRE_CAPTURE_TO_PORT
+# set, the capture records only the datagrams to that destination port
+# (capture-to): the stream to one of several clients behind one address.
+# With BT_WIRE_CAPTURE_RECORD=1 as well, it is the helper's record: every
+# datagram whole, with its clock, SOURCE possibly several addresses, PORT and
+# INTERFACE possibly "any". NETNS "-" is this shell's own network namespace.
 bt_wire_capture_start() { # <netns> <interface> <source> <port> <seconds> <file> [layout receiver-key]
 	local NETNS="$1" FILE="$6" PID START PARENT BEFORE READY
+	local -a COMMAND=(capture) ENTER=(ip netns exec "$1")
+	[[ -z "${BT_WIRE_CAPTURE_TO_PORT:-}" ]] || COMMAND=(capture-to "${BT_WIRE_CAPTURE_TO_PORT}")
+	if [[ "${BT_WIRE_CAPTURE_RECORD:-}" == 1 ]]; then
+		if [[ -z "${BT_WIRE_CAPTURE_TO_PORT:-}" ]]; then
+			echo "    a record needs its destination port (BT_WIRE_CAPTURE_TO_PORT)"
+			return 1
+		fi
+		COMMAND=(record "${BT_WIRE_CAPTURE_TO_PORT}")
+	fi
+	[[ "${NETNS}" != - ]] || ENTER=()
 	shift
 	BT_WIRE_CAPTURE=""
 	BT_WIRE_CAPTURE_FILE="${FILE}"
@@ -302,7 +317,7 @@ bt_wire_capture_start() { # <netns> <interface> <source> <port> <seconds> <file>
 	rm -f -- "${FILE}" "${FILE}.state" "${FILE}.stop" "${FILE}.stop.new" "${FILE}.stderr"
 	bt_wire_now
 	BEFORE="${BT_WIRE_NOW}"
-	bt_wire_spawn BT_WIRE_CAPTURE /dev/null "${FILE}.stderr" ip netns exec "${NETNS}" python3 "${WIRE}" capture "$@" || return 1
+	bt_wire_spawn BT_WIRE_CAPTURE /dev/null "${FILE}.stderr" "${ENTER[@]}" python3 "${WIRE}" "${COMMAND[@]}" "$@" || return 1
 	read -r PID START PARENT <<<"${BT_WIRE_CAPTURE}"
 	if bt_wire_wait_first_line "${BT_WIRE_CAPTURE}" "${FILE}.state" "^ready ${PID} ${START} (0|[1-9][0-9]{0,17})$" 10; then
 		READY="${BASH_REMATCH[1]}"
@@ -332,7 +347,10 @@ bt_wire_capture_start() { # <netns> <interface> <source> <port> <seconds> <file>
 #    clock and no later than this shell's clock once it saw the capture end
 #    (the timing contract above).
 # Either way it must exit 0 within SECONDS, and <records> must be the number
-# of records in FILE. Prints the reason and returns 1 otherwise.
+# of records in FILE. Its end comes only after it drained its queue past the
+# cutoff with no frame dropped; a capture that could not ends "incomplete
+# <records> <dropped> <cutoff>" with status 4, and fails here. Prints the
+# reason and returns 1 otherwise.
 bt_wire_capture_finish() { # <file> <stop|complete> <seconds>
 	local FILE="$1" MODE="$2" LIMIT="$3" PID START PARENT TOKEN="" RECORDS ENDED READY END="" SPAN WANT_END TRANSCRIPT=()
 	read -r PID START PARENT <<<"${BT_WIRE_CAPTURE}"
@@ -413,6 +431,42 @@ bt_wire_capture_finish() { # <file> <stop|complete> <seconds>
 	bt_wire_show state "${FILE}.state"
 	bt_wire_show capture "${FILE}.stderr"
 	return 1
+}
+
+# Whether CAPTURE is whole, as its transcript says: exactly its ready line and
+# an end that counts its records, which a capture writes only after it
+# drained its queue past its cutoff and dropped nothing. What a capture
+# judges must be whole: a count of good datagrams says nothing of the ones it
+# missed.
+bt_wire_capture_whole() { # <capture>
+	local RECORDS TRANSCRIPT=()
+	[[ -f "$1" && -f "$1.state" ]] || return 1
+	RECORDS="$(wc -l <"$1")" || return 1
+	mapfile -t TRANSCRIPT <"$1.state"
+	[[ "${#TRANSCRIPT[@]}" -eq 2 && "${TRANSCRIPT[0]}" =~ ^ready\ [0-9]+\ [0-9]+\ [0-9]+$ &&
+		"${TRANSCRIPT[1]}" =~ ^(complete\ ${RECORDS}\ [0-9]+|stopped\ ${RECORDS}\ [0-9a-f]{32})$ ]]
+}
+
+# One capture is "the capture started last" at a time. To run another while
+# it goes on, park it under a name, start and finish the other, and resume it
+# before finishing it: its handle, file, interval and ready line come back
+# exactly as they were.
+declare -gA BT_WIRE_PARKED=()
+bt_wire_capture_park() { # <name>
+	if [[ -z "${BT_WIRE_CAPTURE:-}" || -n "${BT_WIRE_PARKED[$1]:-}" ]]; then
+		echo "    no capture to park as $1, or one is parked there already"
+		return 1
+	fi
+	BT_WIRE_PARKED[$1]="${BT_WIRE_CAPTURE}|${BT_WIRE_CAPTURE_FILE}|${BT_WIRE_CAPTURE_SECONDS}|${BT_WIRE_CAPTURE_READY}|${BT_WIRE_CAPTURE_READY_CLOCK}"
+	BT_WIRE_CAPTURE=""
+}
+bt_wire_capture_resume() { # <name>
+	if [[ -z "${BT_WIRE_PARKED[$1]:-}" || -n "${BT_WIRE_CAPTURE:-}" ]]; then
+		echo "    no capture is parked as $1, or another is running"
+		return 1
+	fi
+	IFS='|' read -r BT_WIRE_CAPTURE BT_WIRE_CAPTURE_FILE BT_WIRE_CAPTURE_SECONDS BT_WIRE_CAPTURE_READY 		BT_WIRE_CAPTURE_READY_CLOCK <<<"${BT_WIRE_PARKED[$1]}"
+	unset 'BT_WIRE_PARKED[$1]'
 }
 
 # ── Replay ───────────────────────────────────────────────────────────────────
@@ -530,10 +584,15 @@ bt_wire_validate_kinds() { # <output> <S1,S2,S3,S4>
 		INDEX=$((INDEX + 1))
 	done
 }
-# Run `kinds sip` on CAPTURE and validate its whole output. The helper's
-# status and its output are both required; its stderr is shown on failure.
+# Run `kinds sip` on CAPTURE, which must be whole, and validate its whole
+# output. The helper's status and its output are both required; its stderr
+# is shown on failure.
 bt_wire_kinds() { # <capture> <S1,S2,S3,S4>
 	local OUTPUT
+	if ! bt_wire_capture_whole "$1"; then
+		BT_WIRE_REASON="the capture is not whole: its transcript does not end complete or stopped with all its records ($(tr '\n' ' ' <"$1.state" 2>/dev/null))"
+		return 1
+	fi
 	if ! OUTPUT="$(python3 "${WIRE}" kinds sip "$1" "$2" 2>"$1.kinds-stderr")"; then
 		BT_WIRE_REASON="the helper failed: $(tr '\n' ' ' <"$1.kinds-stderr")"
 		return 1
@@ -601,6 +660,71 @@ bt_wire_assert_sip() { # <label> <capture> <S1,S2,S3,S4> <kind:rule[:shaped|rand
 }
 # How many datagrams of the last validated result carry a request line, over
 # all packet kinds: what the pooled check this replaces looked at.
+# ── Imitation auto: the server's datagrams against an expectation ───────────
+# Whether a capture of the server's datagrams to one client is what EXPECT
+# says the server selected for that peer: dns, quic, sip or stun, or random
+# for an unresolved peer. Sets BT_WIRE_REASON to the counts it judged by,
+# and changes no test counter, so that a caller can also hold a capture to an
+# expectation it must contradict. The capture must be whole
+# (bt_wire_capture_whole). A capture without layout ("prefixes") is
+# counted by classify-auto: a learned dns, quic or stun needs at least 10
+# datagrams of its shape and nothing but its probe replies besides; random
+# needs at least 10 datagrams and none with a dns, stun or sip shape (QUIC's
+# short header is one bit pattern that random bytes have a quarter of the
+# time). A capture with layout ("kinds", S1-S4 given) is judged per packet
+# kind: sip needs at least 10 transports and every kind as the SIP rule of
+# its S makes it, random at least 10 transports and no SIP request line in
+# any kind; both need no unknown, ambiguous, unresolved or malformed record.
+bt_wire_auto_verdict() { # <dns|quic|sip|stun|random> <capture> <prefixes|kinds> [S1,S2,S3,S4]
+	local EXPECT="$1" CAPTURE="$2" COUNTS TOTAL SHAPED REPLIES OTHER KIND SUMMARY BAD=""
+	BT_WIRE_REASON=""
+	if [[ "$3" == prefixes ]]; then
+		if [[ ! "${EXPECT}" =~ ^(dns|quic|stun|random)$ ]]; then
+			BT_WIRE_REASON="a capture without layout does not judge ${EXPECT}"
+			return 1
+		fi
+		if ! COUNTS="$(python3 "${WIRE}" classify-auto "$([[ "${EXPECT}" == random ]] && echo none || echo "${EXPECT}")" "${CAPTURE}" 2>&1)" ||
+			[[ ! "${COUNTS}" =~ ^(0|[1-9][0-9]*)\ (0|[1-9][0-9]*)\ (0|[1-9][0-9]*)\ (0|[1-9][0-9]*)$ ]]; then
+			BT_WIRE_REASON="no valid classification ('${COUNTS:-}')"
+			return 1
+		fi
+		if ! bt_wire_capture_whole "${CAPTURE}"; then
+			BT_WIRE_REASON="the capture is not whole: its transcript does not end complete or stopped with all its records ($(tr '\n' ' ' <"${CAPTURE}.state" 2>/dev/null))"
+			return 1
+		fi
+		read -r TOTAL SHAPED REPLIES OTHER <<<"${COUNTS}"
+		if [[ "${EXPECT}" == random ]]; then
+			BT_WIRE_REASON="${TOTAL} datagrams, ${SHAPED} with a dns, stun or sip shape"
+			((TOTAL >= 10 && SHAPED == 0))
+			return
+		fi
+		BT_WIRE_REASON="${TOTAL} datagrams: ${SHAPED} ${EXPECT}-shaped, ${REPLIES} probe replies, ${OTHER} other"
+		((SHAPED >= 10 && OTHER == 0))
+		return
+	fi
+	if [[ "$3" != kinds || ! "${EXPECT}" =~ ^(sip|random)$ ]]; then
+		BT_WIRE_REASON="a per-kind capture judges sip or random, not ${EXPECT} ($3)"
+		return 1
+	fi
+	if ! bt_wire_kinds "${CAPTURE}" "${4:-}"; then
+		BT_WIRE_REASON="no valid per-kind result (${BT_WIRE_REASON})"
+		return 1
+	fi
+	for KIND in ${BT_WIRE_KINDS}; do
+		BT_WIRE_REASON+="${KIND} ${BT_WIRE_SHAPED[${KIND}]}/${BT_WIRE_SEEN[${KIND}]} SIP-shaped, "
+		if [[ "${EXPECT}" == sip ]]; then
+			[[ "${BT_WIRE_VERDICT[${KIND}]}" =~ ^(ok|unobserved)$ ]] || BAD=1
+		else
+			((BT_WIRE_SHAPED[${KIND}] == 0)) || BAD=1
+		fi
+	done
+	for SUMMARY in ${BT_WIRE_SUMMARIES}; do
+		((BT_WIRE_SUMMARY[${SUMMARY}] == 0)) || { BAD=1; BT_WIRE_REASON+="${BT_WIRE_SUMMARY[${SUMMARY}]} ${SUMMARY}, "; }
+	done
+	BT_WIRE_REASON="${BT_WIRE_REASON%, } (S ${4:-})"
+	[[ -z "${BAD}" ]] && ((BT_WIRE_SEEN[transport] >= 10))
+}
+
 bt_wire_pooled_shaped() {
 	local KIND TOTAL=0
 	for KIND in ${BT_WIRE_KINDS}; do
