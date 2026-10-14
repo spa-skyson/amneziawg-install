@@ -472,6 +472,21 @@ if [[ -f /etc/amnezia/amneziawg/params ]]; then
 		FAILED=$((FAILED + 1))
 	fi
 
+	# Without CLIENT_MTU in the environment, AUTO_INSTALL persists the S4-aware
+	# default, 1420 minus S4 and at least 1280, for CLI and web panel clients
+	# (issue #120). The same value is expected in the server and client configs.
+	EXPECTED_MTU=""
+	if [[ "${SERVER_AWG_S4:-}" =~ ^[0-9]+$ ]]; then
+		EXPECTED_MTU=$((1420 - SERVER_AWG_S4))
+		(( EXPECTED_MTU >= 1280 )) || EXPECTED_MTU=1280
+	fi
+	if [[ -n "${EXPECTED_MTU}" ]] && [[ "${CLIENT_MTU:-}" == "${EXPECTED_MTU}" ]]; then
+		echo "  OK: CLIENT_MTU=${CLIENT_MTU} is 1420 minus S4=${SERVER_AWG_S4}"
+	else
+		echo "  FAIL: CLIENT_MTU='${CLIENT_MTU:-}' is not 1420 minus S4='${SERVER_AWG_S4:-}' (expected '${EXPECTED_MTU}')"
+		FAILED=$((FAILED + 1))
+	fi
+
 	if [[ "${AWG_PROTOCOL_VERSION:-}" == "2" ]] && \
 		[[ -z "${AWG_HEADER_PROTECTION_KEY:-}" ]] && \
 		[[ -z "${AWG_CONTENT_PADDING_ADDITION:-}" ]] && \
@@ -519,6 +534,17 @@ if [[ -f "${SERVER_CONF}" ]]; then
 		FAILED=$((FAILED + 1))
 	else
 		echo "  OK: Fresh AWG 2.0 server config omits AWG 3.x-only fields"
+	fi
+
+	# The interface MTU allows for the S4 junk bytes AmneziaWG prepends to
+	# every packet, which awg-quick's automatic MTU does not (issue #120).
+	SERVER_S4=$(grep "^S4 = " "${SERVER_CONF}" | sed 's/^S4 = //')
+	SERVER_MTU=$(grep "^MTU = " "${SERVER_CONF}" | sed 's/^MTU = //')
+	if [[ -n "${EXPECTED_MTU:-}" ]] && [[ "${SERVER_MTU}" == "${EXPECTED_MTU}" ]] && [[ "${SERVER_S4}" == "${SERVER_AWG_S4}" ]]; then
+		echo "  OK: MTU=${SERVER_MTU} allows for S4=${SERVER_S4} (1420 minus S4, at least 1280)"
+	else
+		echo "  FAIL: MTU='${SERVER_MTU}' with S4='${SERVER_S4}' (expected MTU '${EXPECTED_MTU:-}' for S4 '${SERVER_AWG_S4:-}')"
+		FAILED=$((FAILED + 1))
 	fi
 
 	# Verify the native nftables firewall rules were generated (issue #79).
@@ -731,6 +757,15 @@ if [[ -n "${CLIENT_CONF}" ]] && [[ -f "${CLIENT_CONF}" ]]; then
 		fi
 	else
 		echo "  FAIL: S3=${C_S3} or S4=${C_S4} out of range [15-150]"
+		FAILED=$((FAILED + 1))
+	fi
+
+	# The client MTU is the persisted S4-aware default (issue #120)
+	C_MTU=$(grep "^MTU = " "${CLIENT_CONF}" | sed 's/^MTU = //')
+	if [[ -n "${EXPECTED_MTU:-}" ]] && [[ "${C_MTU}" == "${EXPECTED_MTU}" ]]; then
+		echo "  OK: MTU=${C_MTU} matches 1420 minus S4=${C_S4}"
+	else
+		echo "  FAIL: client MTU='${C_MTU}' (expected '${EXPECTED_MTU:-}' for S4=${C_S4})"
 		FAILED=$((FAILED + 1))
 	fi
 

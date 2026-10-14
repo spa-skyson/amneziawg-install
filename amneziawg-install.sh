@@ -2977,6 +2977,29 @@ function removeFromWebPanelDir() {
 	fi
 }
 
+# AmneziaWG prepends S4 junk bytes to every transport packet. awg-quick's
+# automatic MTU, the route MTU minus 80, does not allow for them, so with S4
+# above 20 a full-size packet exceeds 1500 bytes on the wire and fragments.
+# The recommended MTU takes S4 off awg-quick's 1420 default and never goes
+# below 1280, the IPv6 minimum; new installs use it for the server interface
+# and as the client default.
+AWG_QUICK_DEFAULT_MTU=1420
+AWG_MIN_MTU=1280
+# The largest S4 that an automatic (awg-quick default) MTU tolerates on a
+# 1500-byte IPv4 path without fragmenting full-size packets.
+AWG_S4_AUTOMATIC_MTU_LIMIT=20
+
+function recommendedMtuForS4() { # <S4>
+	local S4="${1:-}" MTU
+	if ! [[ "${S4}" =~ ^[0-9]+$ ]]; then
+		echo "ERROR: recommendedMtuForS4 needs a decimal S4, got '${S4}'." >&2
+		return 1
+	fi
+	MTU=$((AWG_QUICK_DEFAULT_MTU - S4))
+	(( MTU >= AWG_MIN_MTU )) || MTU=${AWG_MIN_MTU}
+	printf '%s' "${MTU}"
+}
+
 # Optional client MTU: use an IPv6-compatible minimum for both address families.
 # Reject noncanonical numbers before arithmetic or writing configuration lines.
 function validateClientMtu() {
@@ -8445,6 +8468,28 @@ function askBoringtunImitation() {
 	AWG_BORINGTUN_IMITATE_DOMAIN="${DOMAIN}"
 }
 
+# Ask for the client MTU once S4 is known. The S4-aware recommendation is
+# the default, unless the caller exported a CLIENT_MTU, which is kept as the
+# default instead. An empty answer leaves client configs without an MTU line,
+# so awg-quick picks its automatic MTU; with S4 above 20 that fragments
+# full-size packets, which the prompt then says.
+function askClientMtu() {
+	local RECOMMENDED_MTU
+	RECOMMENDED_MTU="$(recommendedMtuForS4 "${SERVER_AWG_S4}")" || exit 1
+	echo ""
+	echo -e "${GREEN}Client MTU:${NC}"
+	echo "AmneziaWG prepends S4 = ${SERVER_AWG_S4} junk bytes to every packet, which awg-quick's automatic MTU does not allow for."
+	echo "The recommended MTU for S4 = ${SERVER_AWG_S4} is ${RECOMMENDED_MTU}; the server interface uses it."
+	while true; do
+		IFS= read -rp "Client MTU (1280-65535, empty for automatic): " -e -i "${CLIENT_MTU:-${RECOMMENDED_MTU}}" CLIENT_MTU || exit 1
+		validateClientMtu && break
+	done
+	if [[ -z "${CLIENT_MTU}" ]] && (( SERVER_AWG_S4 > AWG_S4_AUTOMATIC_MTU_LIMIT )); then
+		echo -e "${ORANGE}WARNING: with S4 = ${SERVER_AWG_S4} and an automatic MTU, full-size client packets exceed 1500 bytes on the wire and fragment.${NC}"
+		echo -e "${ORANGE}         Set MTU = ${RECOMMENDED_MTU} in the client configs if connections stall.${NC}"
+	fi
+}
+
 function installQuestions() {
 	validateClientMtu || exit 1
 	# Fresh installs remain on AWG 2.0 regardless of caller environment. AWG 3.0
@@ -8584,6 +8629,13 @@ function installQuestions() {
 		SERVER_AWG_S3=${RANDOM_AWG_S3}
 		SERVER_AWG_S4=${RANDOM_AWG_S4}
 
+		# The client MTU defaults to the S4-aware recommendation. A CLIENT_MTU
+		# the operator exported is kept, even an empty one, which leaves the
+		# MTU line out of client configs for awg-quick's automatic MTU.
+		if [[ -z "${CLIENT_MTU+set}" ]]; then
+			CLIENT_MTU="$(recommendedMtuForS4 "${SERVER_AWG_S4}")" || exit 1
+		fi
+
 		generateH1AndH2AndH3AndH4Ranges
 		SERVER_AWG_H1="${RANDOM_AWG_H1_MIN}-${RANDOM_AWG_H1_MAX}"
 		SERVER_AWG_H2="${RANDOM_AWG_H2_MIN}-${RANDOM_AWG_H2_MAX}"
@@ -8687,11 +8739,6 @@ function installQuestions() {
 		echo -e "${ORANGE}Invalid IPv4 address. Enter a valid address or leave empty to skip.${NC}"
 	done
 
-	while true; do
-		IFS= read -rp "Client MTU (1280-65535, empty for automatic): " -e -i "${CLIENT_MTU:-}" CLIENT_MTU || exit 1
-		validateClientMtu && break
-	done
-
 	if [[ "${ENABLE_IPV6}" == "y" ]]; then ALLOWED_IPS_DEFAULT='0.0.0.0/0, ::/0'; else ALLOWED_IPS_DEFAULT='0.0.0.0/0'; fi
 	while true; do
 		echo -e "\nAmneziaWG uses a parameter called AllowedIPs to determine what is routed over the VPN."
@@ -8746,6 +8793,9 @@ function installQuestions() {
 		echo "AmneziaWG requires S3 + 56 != S4 and S4 + 56 != S3"
 		readS3AndS4
 	done
+
+	# Client MTU, asked once S4 is known because the recommended value depends on it
+	askClientMtu
 
 	# H1-H4 Ranged Headers (AmneziaWG 2.0)
 	echo -e "\n${GREEN}H1-H4 Ranged Headers (ranges must not overlap):${NC}"
@@ -9107,6 +9157,38 @@ function configureDebianAmneziaAptSource() {
 	fi
 }
 
+# Print the [Interface] section of a fresh server configuration: the
+# addresses (IPv6 only when enabled), the S4-aware MTU, port, key and the
+# obfuscation parameters. writeFirewallRules appends the hooks. Nothing is
+# printed when a field cannot be rendered.
+function renderAwgServerInterface() {
+	local SERVER_ADDRESS="${SERVER_AWG_IPV4}/24"
+	if [[ "${ENABLE_IPV6}" == "y" ]]; then
+		SERVER_ADDRESS="${SERVER_ADDRESS},${SERVER_AWG_IPV6}/64"
+	fi
+	# awg-quick honours MTU; its automatic value ignores the S4 junk bytes.
+	local SERVER_MTU AWG_PROTOCOL_FIELDS
+	SERVER_MTU="$(recommendedMtuForS4 "${SERVER_AWG_S4}")" || return 1
+	AWG_PROTOCOL_FIELDS="$(renderAwgProtocolFields)" || return 1
+	echo "[Interface]
+Address = ${SERVER_ADDRESS}
+MTU = ${SERVER_MTU}
+ListenPort = ${SERVER_PORT}
+PrivateKey = ${SERVER_PRIV_KEY}
+Jc = ${SERVER_AWG_JC}
+Jmin = ${SERVER_AWG_JMIN}
+Jmax = ${SERVER_AWG_JMAX}
+S1 = ${SERVER_AWG_S1}
+S2 = ${SERVER_AWG_S2}
+S3 = ${SERVER_AWG_S3}
+S4 = ${SERVER_AWG_S4}
+H1 = ${SERVER_AWG_H1}
+H2 = ${SERVER_AWG_H2}
+H3 = ${SERVER_AWG_H3}
+H4 = ${SERVER_AWG_H4}
+${AWG_PROTOCOL_FIELDS}"
+}
+
 # Write the state of a fresh installation, which both backends share: server
 # keys, params, the server configuration with its firewall hooks, and the
 # forwarding sysctls.
@@ -9135,32 +9217,13 @@ function writeAwgServerInstallState() {
 	fi
 	chmod 600 "${AMNEZIAWG_DIR}/params"
 
-	# Add server interface. Include the IPv6 address only when IPv6 is enabled.
-	local SERVER_ADDRESS="${SERVER_AWG_IPV4}/24"
-	if [[ "${ENABLE_IPV6}" == "y" ]]; then
-		SERVER_ADDRESS="${SERVER_ADDRESS},${SERVER_AWG_IPV6}/64"
-	fi
-	local AWG_PROTOCOL_FIELDS=""
-	AWG_PROTOCOL_FIELDS="$(renderAwgProtocolFields)" || {
-		echo -e "${RED}ERROR: Failed to render protocol-specific server configuration.${NC}"
+	# Add server interface. The renderer prints nothing when it fails, so the
+	# empty file a failure leaves behind goes with it.
+	if ! renderAwgServerInterface >"${SERVER_AWG_CONF}"; then
+		rm -f "${SERVER_AWG_CONF}"
+		echo -e "${RED}ERROR: Failed to render the server configuration.${NC}"
 		exit 1
-	}
-	echo "[Interface]
-Address = ${SERVER_ADDRESS}
-ListenPort = ${SERVER_PORT}
-PrivateKey = ${SERVER_PRIV_KEY}
-Jc = ${SERVER_AWG_JC}
-Jmin = ${SERVER_AWG_JMIN}
-Jmax = ${SERVER_AWG_JMAX}
-S1 = ${SERVER_AWG_S1}
-S2 = ${SERVER_AWG_S2}
-S3 = ${SERVER_AWG_S3}
-S4 = ${SERVER_AWG_S4}
-H1 = ${SERVER_AWG_H1}
-H2 = ${SERVER_AWG_H2}
-H3 = ${SERVER_AWG_H3}
-H4 = ${SERVER_AWG_H4}
-${AWG_PROTOCOL_FIELDS}" >"${SERVER_AWG_CONF}"
+	fi
 	chmod 600 "${SERVER_AWG_CONF}"
 
 	# Restore default umask before creating system files and running services
@@ -10965,6 +11028,10 @@ function persistMigration() {
 	# Update server configuration file with migrated values
 	echo -e "${GREEN}Updating server configuration file...${NC}"
 
+	# The S4 the running server used until now, to tell a new one apart below.
+	local ORIG_CONF_S4
+	ORIG_CONF_S4="$(grep -E '^S4 = ' "${SERVER_AWG_CONF}" 2>/dev/null | sed 's/^S4 = //')"
+
 	# Insert or update S3 (try update first, then insert after S2)
 	if grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
 		if ! sed -i "s|^S3 = .*|S3 = ${SERVER_AWG_S3}|" "${SERVER_AWG_CONF}"; then
@@ -11125,6 +11192,16 @@ function persistMigration() {
 
 	echo -e "${GREEN}Migration completed successfully.${NC}"
 	echo ""
+	# A new S4 changes the recommended MTU. An existing server's interface MTU
+	# and CLIENT_MTU are never changed here; the note is for the operator.
+	if [[ "${ORIG_CONF_S4}" != "${SERVER_AWG_S4}" ]]; then
+		local RECOMMENDED_MTU
+		if RECOMMENDED_MTU="$(recommendedMtuForS4 "${SERVER_AWG_S4}")"; then
+			echo -e "${ORANGE}NOTE: S4 is now ${SERVER_AWG_S4}. AmneziaWG prepends S4 junk bytes to every packet, which awg-quick's automatic MTU does not allow for; the recommended MTU is ${RECOMMENDED_MTU}.${NC}"
+			echo -e "${ORANGE}      The server interface MTU and CLIENT_MTU were left as they are. To apply it, set MTU = ${RECOMMENDED_MTU} in ${SERVER_AWG_CONF} and CLIENT_MTU='${RECOMMENDED_MTU}' in ${AMNEZIAWG_DIR}/params before regenerating the client configs.${NC}"
+			echo ""
+		fi
+	fi
 	if (( CLIENT_CONFIGS_RENAMED > 0 )); then
 		echo -e "${ORANGE}NOTE: ${CLIENT_CONFIGS_RENAMED} old client config(s) were renamed with .old suffix.${NC}"
 		echo -e "${ORANGE}You can delete them after regenerating new configs, or keep them for reference.${NC}"

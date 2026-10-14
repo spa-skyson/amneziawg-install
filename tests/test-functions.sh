@@ -442,6 +442,85 @@ fi
 }
 rm -f "${SERIALIZE_TMP}"
 
+echo "=== recommendedMtuForS4 ==="
+# awg-quick's automatic MTU is 1420 on a 1500-byte path and ignores the S4
+# junk bytes, so they come off it, down to the 1280 IPv6 minimum.
+for MTU_CASE in 15:1405 20:1400 21:1399 100:1320 140:1280 141:1280 150:1280 0:1420 200:1280; do
+	assert_eq "${MTU_CASE#*:}" "$(recommendedMtuForS4 "${MTU_CASE%%:*}")" "recommended MTU for S4=${MTU_CASE%%:*}"
+done
+for MTU_BAD_S4 in '' abc -5 1.5 ' 15' '15 ' 0x10; do
+	MTU_RC=0
+	MTU_BAD_OUT="$(recommendedMtuForS4 "${MTU_BAD_S4}" 2>/dev/null)" || MTU_RC=$?
+	assert_eq "1|" "${MTU_RC}|${MTU_BAD_OUT}" "an S4 of '${MTU_BAD_S4}' recommends nothing"
+done
+unset MTU_CASE MTU_BAD_S4 MTU_BAD_OUT MTU_RC
+
+echo "=== renderAwgServerInterface ==="
+_render_server_interface() ( # <S4> <ENABLE_IPV6>
+	SERVER_AWG_IPV4=10.66.66.1; SERVER_AWG_IPV6="fd42:42:42::1"; ENABLE_IPV6="$2"
+	SERVER_PORT=51820; SERVER_PRIV_KEY=SRVPRIV
+	SERVER_AWG_JC=4; SERVER_AWG_JMIN=50; SERVER_AWG_JMAX=1000
+	SERVER_AWG_S1=30; SERVER_AWG_S2=100; SERVER_AWG_S3=45; SERVER_AWG_S4="$1"
+	SERVER_AWG_H1="5-10"; SERVER_AWG_H2="11-20"; SERVER_AWG_H3="21-30"; SERVER_AWG_H4="31-40"
+	AWG_PROTOCOL_VERSION="${AWG_PROTOCOL_VERSION_2}"
+	renderAwgServerInterface
+)
+assert_eq "[Interface]
+Address = 10.66.66.1/24,fd42:42:42::1/64
+MTU = 1300
+ListenPort = 51820
+PrivateKey = SRVPRIV
+Jc = 4
+Jmin = 50
+Jmax = 1000
+S1 = 30
+S2 = 100
+S3 = 45
+S4 = 120
+H1 = 5-10
+H2 = 11-20
+H3 = 21-30
+H4 = 31-40" "$(_render_server_interface 120 y)" "the server interface carries the S4-aware MTU"
+assert_eq "MTU = 1280" "$(_render_server_interface 150 n | grep '^MTU')" "the server MTU never goes below 1280"
+assert_eq "Address = 10.66.66.1/24" "$(_render_server_interface 150 n | grep '^Address')" "an IPv4-only server keeps its IPv4-only address"
+MTU_RC=0
+MTU_RENDER_OUT="$(_render_server_interface '' y 2>/dev/null)" || MTU_RC=$?
+assert_eq "1|" "${MTU_RC}|${MTU_RENDER_OUT}" "an unusable S4 fails the server render without output"
+unset MTU_RC MTU_RENDER_OUT
+
+echo "=== pre-2.0 migration recommends an MTU for a new S4 ==="
+# The migration is the one path that gives an existing server a new S4. It
+# recommends the matching MTU and leaves the interface MTU and CLIENT_MTU as
+# they are; an S4 taken over from the server config gets no note.
+_check_migration_mtu_note() ( # <server config S3/S4: none or S3:S4>
+	local dir note; dir="$(mktemp -d)"
+	trap 'rm -rf "${dir}"' EXIT
+	AMNEZIAWG_DIR="${dir}"; SERVER_AWG_NIC=awg0; SERVER_AWG_CONF="${dir}/awg0.conf"
+	SERVER_PUB_IP=198.51.100.1; SERVER_PUB_NIC=eth0; SERVER_AWG_IPV4=10.66.66.1
+	SERVER_AWG_IPV6="fd42:42:42::1"; SERVER_PORT=51820; SERVER_PRIV_KEY=SRVPRIV; SERVER_PUB_KEY=SRVPUB
+	CLIENT_DNS_1=1.1.1.1; CLIENT_DNS_2=""; CLIENT_MTU=""; ALLOWED_IPS="0.0.0.0/0,::/0"; ENABLE_IPV6=y
+	SERVER_AWG_JC=4; SERVER_AWG_JMIN=50; SERVER_AWG_JMAX=1000
+	SERVER_AWG_S1=30; SERVER_AWG_S2=100; SERVER_AWG_S3=""; SERVER_AWG_S4=""
+	SERVER_AWG_H1="5-10"; SERVER_AWG_H2="11-20"; SERVER_AWG_H3="21-30"; SERVER_AWG_H4="31-40"
+	serializeParams "${dir}/params" || exit 1
+	{
+		printf '[Interface]\nAddress = 10.66.66.1/24,fd42:42:42::1/64\nListenPort = 51820\nPrivateKey = SRVPRIV\nJc = 4\nJmin = 50\nJmax = 1000\nS1 = 30\nS2 = 100\n'
+		[[ "$1" == none ]] || printf 'S3 = %s\nS4 = %s\n' "${1%%:*}" "${1#*:}"
+		printf 'H1 = 5-10\nH2 = 11-20\nH3 = 21-30\nH4 = 31-40\n'
+	} >"${SERVER_AWG_CONF}"
+	# No running service to reload, and no client homes to search.
+	systemctl() { return 1; }
+	getHomeDirForClient() { echo "${dir}/home"; }
+	AUTO_INSTALL=y
+	migrateS3S4 || exit 1
+	persistMigration "${SERVER_AWG_IPV6}" 0 >"${dir}/stdout" 2>"${dir}/stderr" || exit 1
+	note="$(sed 's/\x1b\[[0-9;]*m//g' "${dir}/stdout" | grep -c "^NOTE: S4 is now ${SERVER_AWG_S4}\. .* the recommended MTU is $(recommendedMtuForS4 "${SERVER_AWG_S4}")\.$" || true)"
+	printf '%s|%s|%s|%s' "${note}" "$(grep -c '^MTU' "${SERVER_AWG_CONF}" || true)" \
+		"$(grep '^CLIENT_MTU=' "${dir}/params")" "$(grep -c "^S4 = ${SERVER_AWG_S4}$" "${SERVER_AWG_CONF}" || true)"
+)
+assert_eq "1|0|CLIENT_MTU=''|1" "$(_check_migration_mtu_note none)" "a generated S4 is persisted with an MTU note and no MTU change"
+assert_eq "0|0|CLIENT_MTU=''|1" "$(_check_migration_mtu_note 45:120)" "an S4 taken over from the server config gets no MTU note"
+
 echo "=== optional client MTU persistence ==="
 MTU_PARAMS_DIR="$(mktemp -d)"
 MTU_PARAMS="${MTU_PARAMS_DIR}/params"
@@ -502,34 +581,55 @@ assert_eq 1 "${MTU_RC}" "load rejects invalid persisted client MTU"
 MTU_RC=0
 ( CLIENT_MTU=1279 AUTO_INSTALL=y installQuestions ) >/dev/null 2>&1 || MTU_RC=$?
 assert_eq 1 "${MTU_RC}" "automatic install rejects invalid MTU"
-_check_install_mtu() (
-	local mode="$1" value="$2" dir answers
+# Result: persisted CLIENT_MTU | invalid-MTU diagnostics | automatic-MTU
+# warnings | recommendation lines for S4 | persisted S4. Mode y is an automatic
+# install with CLIENT_MTU=VALUE, unset one without CLIENT_MTU, and n an
+# interactive install answering VALUE at the MTU prompt.
+_check_install_mtu() ( # <mode> <value> [S4]
+	local mode="$1" value="$2" s4="${3:-120}" dir answers stdout
 	dir="$(mktemp -d)"
 	trap 'rm -rf "${dir}"' EXIT
-	# Only host discovery is mocked; all prompts, validation and persistence run.
+	# Only host discovery and the random S3/S4 are mocked; all prompts,
+	# validation and persistence run.
 	detectPublicIPv4() { echo 198.51.100.1; }
 	ip() { echo 'default via 198.51.100.254 dev eth0'; }
 	ipv6Available() { return 1; }
+	generateS3AndS4() { RANDOM_AWG_S3=45; RANDOM_AWG_S4="${s4}"; }
 	AUTO_INSTALL="${mode}"
 	CLIENT_MTU=""
-	if [[ "${mode}" == y ]]; then CLIENT_MTU="${value}"; fi
-	answers=$'198.51.100.1\neth0\nawg0\n10.66.66.1\nn\n51820\n1.1.1.1\n\n'
-	answers+="${value}"$'\n0.0.0.0/0\n4\n50\n1000\n30\n100\n45\n120\n5-10\n11-20\n21-30\n31-40\ny\n'
+	case "${mode}" in
+		y) CLIENT_MTU="${value}";;
+		unset) AUTO_INSTALL=y; unset CLIENT_MTU;;
+	esac
+	# The MTU prompt follows S4, which its recommended default depends on.
+	answers=$'198.51.100.1\neth0\nawg0\n10.66.66.1\nn\n51820\n1.1.1.1\n\n0.0.0.0/0\n4\n50\n1000\n30\n100\n45\n'
+	answers+="${s4}"$'\n'"${value}"$'\n5-10\n11-20\n21-30\n31-40\ny\n'
 	installQuestions >"${dir}/stdout" 2>"${dir}/stderr" <<<"${answers}" || exit 1
 	serializeParams "${dir}/params" || exit 1
 	unset CLIENT_MTU
 	source "${dir}/params"
-	printf '%s|%s' "${CLIENT_MTU:-}" "$(grep -c 'CLIENT_MTU must' "${dir}/stderr" || true)"
+	stdout="$(sed 's/\x1b\[[0-9;]*m//g' "${dir}/stdout")"
+	printf '%s|%s|%s|%s|%s' "${CLIENT_MTU:-}" "$(grep -c 'CLIENT_MTU must' "${dir}/stderr" || true)" \
+		"$(grep -c "^WARNING: with S4 = ${s4} and an automatic MTU" <<<"${stdout}" || true)" \
+		"$(grep -c "^The recommended MTU for S4 = ${s4} is $(recommendedMtuForS4 "${s4}");" <<<"${stdout}" || true)" \
+		"${SERVER_AWG_S4}"
 )
-assert_eq '1380|0' "$(_check_install_mtu y 1380)" "automatic install persists requested MTU"
-assert_eq '1380|0' "$(_check_install_mtu n 1380)" "interactive install accepts valid MTU on first attempt"
-assert_eq '|0' "$(_check_install_mtu n '')" "interactive install accepts omitted MTU"
-assert_eq '1380|1' "$(_check_install_mtu n $'1279\n1380')" "interactive install retries invalid MTU and persists correction"
+assert_eq '1380|0|0|0|120' "$(_check_install_mtu y 1380)" "automatic install persists requested MTU"
+assert_eq '|0|0|0|120' "$(_check_install_mtu y '')" "automatic install keeps an explicitly empty MTU automatic"
+assert_eq '1300|0|0|0|120' "$(_check_install_mtu unset '')" "automatic install defaults the MTU to 1420 minus S4"
+assert_eq '1400|0|0|0|20' "$(_check_install_mtu unset '' 20)" "automatic install default follows S4"
+assert_eq '1280|0|0|0|150' "$(_check_install_mtu unset '' 150)" "automatic install default stays at the 1280 floor"
+assert_eq '1380|0|0|1|120' "$(_check_install_mtu n 1380)" "interactive install accepts valid MTU on first attempt"
+assert_eq '1300|0|0|1|120' "$(_check_install_mtu n 1300)" "interactive install accepts the recommended MTU without warning"
+assert_eq '|0|1|1|120' "$(_check_install_mtu n '')" "interactive install accepts omitted MTU and warns for S4 above 20"
+assert_eq '|0|1|1|21' "$(_check_install_mtu n '' 21)" "interactive install warns at S4 21 when the MTU stays automatic"
+assert_eq '|0|0|1|20' "$(_check_install_mtu n '' 20)" "interactive install does not warn at S4 20 when the MTU stays automatic"
+assert_eq '1380|1|0|1|120' "$(_check_install_mtu n $'1279\n1380')" "interactive install retries invalid MTU and persists correction"
 for MTU_WHITESPACE in ' 1380' '1380 ' '   ' $'\t1380\t' $'\t'; do
 	MTU_RC=0
 	MTU_PROMPT_RESULT="$(_check_install_mtu n "${MTU_WHITESPACE}"$'\n1380')" || MTU_RC=$?
 	assert_eq 0 "${MTU_RC}" "interactive MTU whitespace fixture succeeds"
-	assert_eq '1380|1' "${MTU_PROMPT_RESULT}" "interactive install rejects MTU whitespace before accepting correction"
+	assert_eq '1380|1|0|1|120' "${MTU_PROMPT_RESULT}" "interactive install rejects MTU whitespace before accepting correction"
 done
 unset MTU_WHITESPACE MTU_PROMPT_RESULT
 printf 'unchanged\n' >"${MTU_PARAMS}"
