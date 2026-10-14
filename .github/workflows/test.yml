@@ -30,6 +30,7 @@ jobs:
       - name: Run unit tests
         run: |
           bash tests/test-functions.sh
+          bash tests/test-dkms-compat.sh
           bash tests/test-awg3.sh
           bash tests/test-backend.sh
           bash tests/test-boringtun-artifact.sh
@@ -138,6 +139,23 @@ jobs:
 
       - name: Validate signed PPA selection, DKMS, module, and tools
         run: sudo bash tests/test-ubuntu-resolute-live.sh
+
+      # Runner images roll out gradually. Also compile for the newest Azure
+      # headers so a passing job on an older image cannot hide a backport break.
+      - name: Build DKMS for the latest Azure headers
+        run: |
+          sudo apt-get install -y linux-headers-azure
+          for headers in /usr/src/linux-headers-*-azure; do
+            sudo dkms autoinstall -k "${headers##*/linux-headers-}"
+          done
+
+      - name: Show DKMS build diagnostics
+        if: failure()
+        run: |
+          uname -a
+          gcc --version
+          sudo dkms status || true
+          sudo find /var/lib/dkms/amneziawg -type f -name make.log -print -exec cat {} \;
 
   ppa-architecture-variants:
     name: Ubuntu 26.04 PPA Architecture Variants

@@ -386,6 +386,7 @@ Override specific defaults with environment variables:
 | `SERVER_PORT` | Random (49152–65535) |
 | `CLIENT_DNS_1` | `1.1.1.1` |
 | `CLIENT_DNS_2` | `1.0.0.1` |
+| `CLIENT_MTU` | Unset (omit `MTU` from generated client configs) |
 | `ALLOWED_IPS` | `0.0.0.0/0, ::/0` (IPv4 only when `ENABLE_IPV6=n`) |
 | `CREATE_INITIAL_CLIENT` | `yes` in `AUTO_INSTALL`; prompted interactively |
 
@@ -400,7 +401,24 @@ sudo AUTO_INSTALL=y SERVER_PORT=51820 CLIENT_DNS_1=8.8.8.8 ./amneziawg-install.s
 
 # IPv4-only server
 sudo AUTO_INSTALL=y ENABLE_IPV6=n ./amneziawg-install.sh
+
+# Persist an explicit MTU for new clients from the CLI and web panel
+sudo AUTO_INSTALL=y CLIENT_MTU=1380 ./amneziawg-install.sh
 ```
+
+`CLIENT_MTU` is optional. Set it during interactive installation or through the
+environment for automatic installation. Accepted values are decimal integers
+from **1280 to 65535**, without leading zeros; the minimum also supports IPv6.
+Choose a value suitable for your network path. The installer does not calculate
+an MTU from the obfuscation parameters or change the server interface MTU.
+
+For an existing installation, add or update `CLIENT_MTU='1380'` in the root-owned
+`/etc/amnezia/amneziawg/params` file. The CLI and web panel use that value for
+subsequently generated clients, including explicit CLI regeneration. Existing
+client files stay unchanged until regenerated. Remove the setting or use
+`CLIENT_MTU=''` to omit the MTU line again. Old params files without this key
+retain their current behavior, even if `CLIENT_MTU` is exported in the environment.
+Web generation requires the updated web binary and privileged helper.
 
 ---
 
@@ -791,6 +809,18 @@ temporary, narrowly scoped fallback:
 Uninstalling AmneziaWG removes only source entries that exactly match the
 Amnezia PPA, including a fallback entry left by an interrupted older install.
 Unrelated APT sources in the same file are preserved.
+
+Ubuntu kernels such as `7.0.0-1017-azure` backport UDP tunnel API changes that
+the upstream AmneziaWG module's version checks do not recognize. During Debian
+and Ubuntu kernel-backend installation or module repair, the installer replaces
+the two known compatibility macros in the installed DKMS source with checks of
+the actual function signatures. This supports both older and backported APIs.
+If package configuration failed before the fix was applied, the same package
+transaction is retried once. Rerunning an interrupted install patches existing
+source before prerequisite package operations. The patched source also supports
+later kernel rebuilds; replacing the DKMS package can replace that source.
+Unrecognized or newer upstream macros are left unchanged. CI builds against both
+the running kernel and the latest Azure headers.
 
 Temporarily disabled:
 

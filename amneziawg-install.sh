@@ -2977,12 +2977,32 @@ function removeFromWebPanelDir() {
 	fi
 }
 
+# Optional client MTU: use an IPv6-compatible minimum for both address families.
+# Reject noncanonical numbers before arithmetic or writing configuration lines.
+function validateClientMtu() {
+	local MTU="${CLIENT_MTU:-}"
+	[[ -n "${MTU}" ]] || return 0
+	if ! [[ "${MTU}" =~ ^[1-9][0-9]{3,4}$ ]] || (( MTU < 1280 || MTU > 65535 )); then
+		echo "ERROR: CLIENT_MTU must be empty or a decimal integer from 1280 to 65535 without leading zeros." >&2
+		return 1
+	fi
+}
+
+# Append to the DNS line so an unset MTU leaves the generated file unchanged.
+function renderClientMtu() {
+	validateClientMtu || return 1
+	if [[ -n "${CLIENT_MTU:-}" ]]; then
+		printf '\nMTU = %s' "${CLIENT_MTU}"
+	fi
+}
+
 # Serialize all server parameters to a params file
 # Uses safe quoting for string values to prevent shell injection when sourced
 # Arguments:
 #   $1 - Output file path to write the serialized params to
 function serializeParams() {
 	local OUTPUT_FILE="$1"
+	validateClientMtu || return 1
 	if [[ -z "${OUTPUT_FILE}" ]]; then
 		echo "ERROR: serializeParams() requires an output file path" >&2
 		return 1
@@ -3015,6 +3035,7 @@ SERVER_PRIV_KEY=$(safeQuoteParam "${SERVER_PRIV_KEY}")
 SERVER_PUB_KEY=$(safeQuoteParam "${SERVER_PUB_KEY}")
 CLIENT_DNS_1=$(safeQuoteParam "${CLIENT_DNS_1}")
 CLIENT_DNS_2=$(safeQuoteParam "${CLIENT_DNS_2}")
+CLIENT_MTU=$(safeQuoteParam "${CLIENT_MTU:-}")
 ALLOWED_IPS=$(safeQuoteParam "${ALLOWED_IPS}")
 ENABLE_IPV6=$(safeQuoteParam "${ENABLE_IPV6:-}")
 SERVER_AWG_JC=$(safeQuoteParam "${SERVER_AWG_JC}")
@@ -3054,7 +3075,7 @@ EOF
 # The keys serializeParams writes, in its order: AWG_PARAMS_KEYS for every
 # backend, then AWG_PARAMS_BORINGTUN_KEYS for BoringTun. A test keeps this list
 # equal to what serializeParams writes.
-AWG_PARAMS_KEYS="SERVER_PUB_IP SERVER_PUB_NIC SERVER_AWG_NIC SERVER_AWG_IPV4 SERVER_AWG_IPV6 SERVER_PORT SERVER_PRIV_KEY SERVER_PUB_KEY CLIENT_DNS_1 CLIENT_DNS_2 ALLOWED_IPS ENABLE_IPV6 SERVER_AWG_JC SERVER_AWG_JMIN SERVER_AWG_JMAX SERVER_AWG_S1 SERVER_AWG_S2 SERVER_AWG_S3 SERVER_AWG_S4 SERVER_AWG_H1 SERVER_AWG_H2 SERVER_AWG_H3 SERVER_AWG_H4 AWG_BACKEND AWG_PROTOCOL_VERSION AWG_HEADER_PROTECTION_KEY AWG_CONTENT_PADDING_ADDITION AWG_REKEY_AFTER_TIME AWG_REKEY_TIMEOUT AWG_REJECT_AFTER_TIME AWG_KEEPALIVE_TIMEOUT AWG_RANDOM_TRAILERS AWG_DISABLE_COOKIES"
+AWG_PARAMS_KEYS="SERVER_PUB_IP SERVER_PUB_NIC SERVER_AWG_NIC SERVER_AWG_IPV4 SERVER_AWG_IPV6 SERVER_PORT SERVER_PRIV_KEY SERVER_PUB_KEY CLIENT_DNS_1 CLIENT_DNS_2 CLIENT_MTU ALLOWED_IPS ENABLE_IPV6 SERVER_AWG_JC SERVER_AWG_JMIN SERVER_AWG_JMAX SERVER_AWG_S1 SERVER_AWG_S2 SERVER_AWG_S3 SERVER_AWG_S4 SERVER_AWG_H1 SERVER_AWG_H2 SERVER_AWG_H3 SERVER_AWG_H4 AWG_BACKEND AWG_PROTOCOL_VERSION AWG_HEADER_PROTECTION_KEY AWG_CONTENT_PADDING_ADDITION AWG_REKEY_AFTER_TIME AWG_REKEY_TIMEOUT AWG_REJECT_AFTER_TIME AWG_KEEPALIVE_TIMEOUT AWG_RANDOM_TRAILERS AWG_DISABLE_COOKIES"
 AWG_PARAMS_BORINGTUN_KEYS="AWG_BORINGTUN_IMITATE_PROTOCOL AWG_BORINGTUN_IMITATE_DOMAIN"
 
 function awgParamsCanonicalKeys() { # <backend>
@@ -3536,6 +3557,57 @@ function sanitizeAwgDkmsConf() {
 	for AWG_DKMS_CONF in /var/lib/dkms/amneziawg/*/source/dkms.conf; do
 		[[ -f "${AWG_DKMS_CONF}" ]] && sed -i '/^REMAKE_INITRD=/d' "${AWG_DKMS_CONF}"
 	done
+}
+
+# Ubuntu can backport UDP tunnel API changes without changing the upstream
+# kernel version (7.0.0-1017-azure has the new setup API but the old release API).
+# Replace only the two known upstream compatibility macros, selecting pointers
+# by each function's actual type. The source stays usable by older kernels too.
+# Upstream: amnezia-vpn/amneziawg-linux-kernel-module commit 0bcc6dfaf9.
+# Prints the number of changed source trees; unknown/newer source is untouched.
+function patchAwgDkmsUdpTunnelCompat() {
+	local SOURCE_ROOT="${1:-/usr/src}" HEADER TEMP_FILE RC CHANGED=0
+	local SETUP_OLD='#define setup_udp_tunnel_sock(net, sk, sock_cfg) setup_udp_tunnel_sock(net, sk->sk_socket, sock_cfg)'
+	local RELEASE_OLD='#define udp_tunnel_sock_release(sk) udp_tunnel_sock_release(sk->sk_socket)'
+	for HEADER in "${SOURCE_ROOT}"/amneziawg-*/compat/compat.h; do
+		[[ -f "${HEADER}" ]] || continue
+		RC=0
+		grep -qFx -e "${SETUP_OLD}" -e "${RELEASE_OLD}" "${HEADER}" || RC=$?
+		[[ "${RC}" == 1 ]] && continue
+		[[ "${RC}" == 0 ]] || return 1
+		TEMP_FILE="$(mktemp "${HEADER}.XXXXXX")" || return 1
+		if ! awk -v setup="${SETUP_OLD}" -v release="${RELEASE_OLD}" '
+			$0 == setup {
+				print "#define setup_udp_tunnel_sock(awg_net, sk, sock_cfg) setup_udp_tunnel_sock(awg_net, __builtin_choose_expr(__builtin_types_compatible_p(__typeof__(&setup_udp_tunnel_sock), void (*)(struct net *, struct socket *, struct udp_tunnel_sock_cfg *)), (sk)->sk_socket, (sk)), sock_cfg)"
+				next
+			}
+			$0 == release {
+				print "#define udp_tunnel_sock_release(sk) udp_tunnel_sock_release(__builtin_choose_expr(__builtin_types_compatible_p(__typeof__(&udp_tunnel_sock_release), void (*)(struct socket *)), (sk)->sk_socket, (sk)))"
+				next
+			}
+			{ print }
+		' "${HEADER}" >"${TEMP_FILE}" || ! chmod --reference="${HEADER}" "${TEMP_FILE}" || ! mv -f "${TEMP_FILE}" "${HEADER}"; then
+			rm -f "${TEMP_FILE}"
+			return 1
+		fi
+		CHANGED=$((CHANGED + 1))
+	done
+	printf '%s\n' "${CHANGED}"
+}
+
+# Package postinst builds DKMS before apt returns. If that build fails, apply
+# the known compatibility fix and retry the same transaction once. Also patch
+# successful installs so future kernel upgrades can rebuild the same source.
+function installAwgDebianPackages() {
+	local RC=0 PATCHED
+	"$@" || RC=$?
+	PATCHED="$(patchAwgDkmsUdpTunnelCompat /usr/src)" || return 1
+	if [[ "${RC}" != 0 && "${PATCHED}" != 0 ]]; then
+		echo "Applied AmneziaWG UDP tunnel compatibility fix; retrying package configuration."
+		"$@"
+	else
+		return "${RC}"
+	fi
 }
 
 function aptPackageIsInstalled() {
@@ -4185,6 +4257,7 @@ function ensureAmneziawgKernelModule() {
 
 	echo -e "${ORANGE}amneziawg kernel module is not built or loaded for kernel ${KERNEL_VER}.${NC}"
 	echo -e "${ORANGE}Attempting automatic repair...${NC}"
+	patchAwgDkmsUdpTunnelCompat /usr/src >/dev/null || return 1
 
 	# Install missing kernel headers so DKMS can compile the module.
 	# installKernelHeaders() tries candidates in order and warns on failure.
@@ -8373,6 +8446,7 @@ function askBoringtunImitation() {
 }
 
 function installQuestions() {
+	validateClientMtu || exit 1
 	# Fresh installs remain on AWG 2.0 regardless of caller environment. AWG 3.0
 	# and AWG 3.1 can be enabled only after installation through the explicit
 	# capability-gated migration.
@@ -8611,6 +8685,11 @@ function installQuestions() {
 			break
 		fi
 		echo -e "${ORANGE}Invalid IPv4 address. Enter a valid address or leave empty to skip.${NC}"
+	done
+
+	while true; do
+		IFS= read -rp "Client MTU (1280-65535, empty for automatic): " -e -i "${CLIENT_MTU:-}" CLIENT_MTU || exit 1
+		validateClientMtu && break
 	done
 
 	if [[ "${ENABLE_IPV6}" == "y" ]]; then ALLOWED_IPS_DEFAULT='0.0.0.0/0, ::/0'; else ALLOWED_IPS_DEFAULT='0.0.0.0/0'; fi
@@ -9113,6 +9192,12 @@ function installAmneziaWG() {
 	# Run setup questions first
 	installQuestions
 
+	# A previous failed DKMS build can leave a half-configured package whose
+	# postinst runs again during prerequisite installs, before the module install.
+	if [[ "${OS}" == ubuntu || "${OS}" == debian ]]; then
+		patchAwgDkmsUdpTunnelCompat /usr/src >/dev/null || return 1
+	fi
+
 	# Install AmneziaWG tools and module
 	# Force IPv4 preference for all package-manager operations — IPv6 may be
 	# resolvable but unreachable on some VPS providers, causing apt, dnf,
@@ -9149,7 +9234,7 @@ function installAmneziaWG() {
 		prepareUbuntuAmneziaPpaForInstall
 		# Install kernel headers for the running kernel so DKMS can compile the module.
 		installKernelHeaders "$(uname -r)"
-		apt install -y dkms iptables nftables amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+		installAwgDebianPackages apt install -y dkms iptables nftables amneziawg amneziawg-tools qrencode || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'debian' ]]; then
 		if ! grep -q "^deb-src" /etc/apt/sources.list; then
 			# Tag managed file with sentinel so uninstall can verify ownership
@@ -9163,7 +9248,7 @@ function installAmneziaWG() {
 		apt-get update || { echo -e "${RED}ERROR: Failed to update package index.${NC}"; exit 1; }
 		# Install kernel headers for the running kernel so DKMS can compile the module.
 		installKernelHeaders "$(uname -r)"
-		apt-get install -y dkms amneziawg amneziawg-tools qrencode iptables nftables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
+		installAwgDebianPackages apt-get install -y dkms amneziawg amneziawg-tools qrencode iptables nftables || { echo -e "${RED}ERROR: Package installation failed. Check your internet connection and try again.${NC}"; exit 1; }
 	elif [[ ${OS} == 'fedora' ]]; then
 		dnf config-manager --set-enabled crb
 		dnf install -y epel-release
@@ -9391,6 +9476,8 @@ function clientIPv4InUse() {
 }
 
 function newClient() {
+	local CLIENT_MTU_LINE
+	CLIENT_MTU_LINE="$(renderClientMtu)" || return 1
 	ensureAwgBackendReady
 	# Reset variables to ensure clean state for each new client
 	local CLIENT_NAME=""
@@ -9615,7 +9702,7 @@ function newClient() {
 	echo "[Interface]
 PrivateKey = ${CLIENT_PRIV_KEY}
 Address = ${CLIENT_ADDRESS}
-DNS = ${CLIENT_DNS}
+DNS = ${CLIENT_DNS}${CLIENT_MTU_LINE}
 Jc = ${SERVER_AWG_JC}
 Jmin = ${SERVER_AWG_JMIN}
 Jmax = ${SERVER_AWG_JMAX}
@@ -9791,6 +9878,8 @@ function revokeClient() {
 }
 
 function regenerateClients() {
+	local CLIENT_MTU_LINE
+	CLIENT_MTU_LINE="$(renderClientMtu)" || return 1
 	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "${SERVER_AWG_CONF}")
 	if [[ ${NUMBER_OF_CLIENTS} == '0' ]]; then
 		echo ""
@@ -10097,7 +10186,7 @@ function regenerateClients() {
 [Interface]
 PrivateKey = ${CLIENT_PRIV_KEY}
 Address = ${CLIENT_ADDRESS}
-DNS = ${CLIENT_DNS}
+DNS = ${CLIENT_DNS}${CLIENT_MTU_LINE}
 Jc = ${SERVER_AWG_JC}
 Jmin = ${SERVER_AWG_JMIN}
 Jmax = ${SERVER_AWG_JMAX}
@@ -10528,7 +10617,7 @@ function validateParamsFile() {
 	# Params must be authoritative; do not let exported shell variables fill in
 	# keys that older params files legitimately lack, select an AWG backend or a
 	# BoringTun protocol imitation, or enable AWG 3.0 features.
-	unset ENABLE_IPV6 AWG_PROTOCOL_VERSION AWG_HEADER_PROTECTION_KEY \
+	unset CLIENT_MTU ENABLE_IPV6 AWG_PROTOCOL_VERSION AWG_HEADER_PROTECTION_KEY \
 		AWG_CONTENT_PADDING_ADDITION AWG_REKEY_AFTER_TIME AWG_REKEY_TIMEOUT \
 		AWG_REJECT_AFTER_TIME AWG_KEEPALIVE_TIMEOUT AWG_RANDOM_TRAILERS \
 		AWG_DISABLE_COOKIES AWG_BACKEND AWG_BORINGTUN_IMITATE_PROTOCOL \
@@ -10539,6 +10628,10 @@ function validateParamsFile() {
 		echo -e "${ORANGE}The file may be corrupted or contain a syntax error. Fix or regenerate it and rerun the installer.${NC}" >&2
 		return 1
 	fi
+	# Normalize a legacy omission to the same empty value serialization writes,
+	# so transactional params comparisons remain stable across an upgrade.
+	CLIENT_MTU="${CLIENT_MTU:-}"
+	validateClientMtu || return 1
 	if ! validatePersistedAwgBackendState; then
 		echo -e "${RED}ERROR: Invalid AWG backend state in ${AMNEZIAWG_DIR}/params.${NC}" >&2
 		return 1
@@ -13063,6 +13156,8 @@ function nonInteractiveAddClient() (
 	# Reload only after locking: a protocol transaction may have completed after
 	# this CLI process started but before it acquired the lifecycle lock.
 	loadParams
+	local CLIENT_MTU_LINE
+	CLIENT_MTU_LINE="$(renderClientMtu)" || exit 1
 
 	# Ensure the config path follows the freshly loaded interface name.
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
@@ -13164,7 +13259,7 @@ function nonInteractiveAddClient() (
 	echo "[Interface]
 PrivateKey = ${CLIENT_PRIV_KEY}
 Address = ${CLIENT_ADDRESS}
-DNS = ${CLIENT_DNS}
+DNS = ${CLIENT_DNS}${CLIENT_MTU_LINE}
 Jc = ${SERVER_AWG_JC}
 Jmin = ${SERVER_AWG_JMIN}
 Jmax = ${SERVER_AWG_JMAX}
