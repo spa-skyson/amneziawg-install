@@ -4,7 +4,9 @@
 //! between the *start* of consecutive cycles is `interval` seconds, regardless
 //! of how long each cycle takes.
 //!
-//! 1. Calls `awg::show_all_dump()` on a blocking thread – reads current AWG state.
+//! 1. Calls `awg::show_all_dump()` on a blocking thread – reads current AWG state
+//!    and keeps only the managed interface (`AWG_INTERFACE`, else `SERVER_AWG_NIC`
+//!    from the installer params).  Other interfaces on the host are ignored.
 //! 2. Writes a snapshot row per peer into `snapshots`.
 //! 3. Upserts each peer into the `peers` table.
 //!    3b. Removes disabled peers from the running AWG interface
@@ -14,8 +16,9 @@
 //! 5. Applies config-to-peer mapping (sets `has_config`, `config_name`,
 //!    `config_path` on matching peers).
 //! 6. Removes stale peers – DB rows for non-disabled peers whose public
-//!    keys no longer appear on any AWG interface.  This cleans up
-//!    artifacts left when peers are removed outside the web panel.
+//!    keys no longer appear on the managed AWG interface.  This cleans up
+//!    artifacts left when peers are removed outside the web panel, and rows
+//!    recorded from other interfaces before the poller was scoped.
 //!
 //! Errors within a single cycle step are logged and the cycle continues;
 //! the overall polling loop never stops due to a single-cycle failure.
@@ -34,6 +37,9 @@ use crate::awg;
 use crate::config_store;
 use crate::db::Database;
 use crate::domain::PublicKey;
+use crate::managed_interface::{
+    scope_to_interface, InterfaceSelector, ManagedInterfaceError, ScopedInterfaces,
+};
 
 /// Serializes access to the clear-all + re-map sequence so that concurrent
 /// calls from the poller and on-demand `rescan_configs` cannot interleave, and
@@ -60,12 +66,24 @@ pub struct Poller {
     lifecycle_lock_dir: PathBuf,
     /// Maximum age of snapshots in days before cleanup (0 = disabled).
     snapshot_retention_days: u32,
+    /// Which AWG interface the poller records and enforces.
+    interface: InterfaceSelector,
+    /// Last reported interface scope, so changes are logged once rather than
+    /// on every cycle.
+    scope_log: std::sync::Arc<std::sync::Mutex<ScopeLog>>,
 }
 
 impl Poller {
     #[cfg(test)]
     pub fn new(db: Database, interval_secs: u64, config_dir: PathBuf) -> Self {
-        Self::new_full(db, interval_secs, config_dir.clone(), config_dir, 0)
+        Self::new_full(
+            db,
+            interval_secs,
+            config_dir.clone(),
+            config_dir,
+            0,
+            InterfaceSelector::from_params(),
+        )
     }
 
     pub fn new_full(
@@ -74,6 +92,7 @@ impl Poller {
         config_dir: PathBuf,
         lifecycle_lock_dir: PathBuf,
         snapshot_retention_days: u32,
+        interface: InterfaceSelector,
     ) -> Self {
         Self {
             db,
@@ -81,6 +100,8 @@ impl Poller {
             config_dir,
             lifecycle_lock_dir,
             snapshot_retention_days,
+            interface,
+            scope_log: std::sync::Arc::new(std::sync::Mutex::new(ScopeLog::default())),
         }
     }
 
@@ -92,6 +113,16 @@ impl Poller {
 
     /// Run the polling loop and independent retention task forever.
     pub async fn run(&self) {
+        match self.interface.override_name() {
+            Some(interface) => info!(
+                interface,
+                "poller scoped to the AWG interface set by AWG_INTERFACE"
+            ),
+            None => info!(
+                "poller scoped to SERVER_AWG_NIC from the installer params (set AWG_INTERFACE to override)"
+            ),
+        }
+
         if self.snapshot_retention_days > 0 {
             info!(
                 interval_secs = self.interval.as_secs(),
@@ -179,6 +210,22 @@ impl Poller {
         }
 
         // ── Step 1–3: AWG data ───────────────────────────────────────────────
+        // Resolve the managed interface first.  Without an AWG_INTERFACE
+        // override this reads the installer params through the privileged
+        // helper – a blocking `sudo` call, run off the async executor like the
+        // dump itself.  Without a name there is nothing safe to scope the
+        // dump to, so the cycle's AWG steps are skipped.
+        let managed = match self.resolve_managed_interface().await {
+            Ok(name) => name,
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "cannot determine the managed AWG interface – skipping poll cycle"
+                );
+                return Err(e.into());
+            }
+        };
+
         // `awg show all dump` is a blocking process; run it off the async
         // executor so the independent retention timer (and HTTP tasks) can
         // still be polled while the command is in flight.
@@ -194,10 +241,22 @@ impl Poller {
             }
         };
 
+        // Every other interface on the host is dropped here, so snapshots,
+        // upserts, disabled-peer enforcement and stale-peer cleanup below only
+        // ever see the managed interface.
+        let ScopedInterfaces {
+            matched: interfaces,
+            ignored,
+        } = scope_to_interface(interfaces, &managed);
+        self.log_scope(&managed, !interfaces.is_empty(), &ignored);
+
         let peer_count: usize = interfaces.iter().map(|i| i.peers.len()).sum();
         info!(
+            interface = %managed,
             interface_count = interfaces.len(),
-            peer_count, "awg data retrieved"
+            ignored_interface_count = ignored.len(),
+            peer_count,
+            "awg data retrieved"
         );
 
         let now = chrono::Utc::now();
@@ -244,6 +303,52 @@ impl Poller {
             "poll cycle complete"
         );
         Ok(())
+    }
+
+    /// Resolve the managed interface name on the blocking pool.
+    async fn resolve_managed_interface(&self) -> Result<String, ManagedInterfaceError> {
+        resolve_managed_interface(&self.interface).await
+    }
+
+    /// Report scope changes: the monitored interface (at startup and whenever
+    /// it changes), whether it is present in the dump, and which other
+    /// interfaces the host carries.  Logging only on change keeps a
+    /// permanently present foreign interface from producing a warning on
+    /// every cycle.
+    fn log_scope(&self, managed: &str, present: bool, ignored: &[String]) {
+        let changes = match self.scope_log.lock() {
+            Ok(mut state) => state.observe(managed, present, ignored),
+            Err(poisoned) => poisoned.into_inner().observe(managed, present, ignored),
+        };
+
+        if changes.interface {
+            info!(
+                interface = %managed,
+                source = self.interface.source(),
+                "monitoring AWG interface"
+            );
+        }
+        if changes.presence {
+            if present {
+                info!(interface = %managed, "managed AWG interface is present again");
+            } else {
+                warn!(
+                    interface = %managed,
+                    "managed AWG interface is not present in the dump – peers are left untouched until it is up"
+                );
+            }
+        }
+        if changes.ignored {
+            if ignored.is_empty() {
+                info!(interface = %managed, "no other AWG interfaces present any more");
+            } else {
+                warn!(
+                    interface = %managed,
+                    ignored = ?ignored,
+                    "AWG dump contains other interfaces – they are not monitored by this panel (set AWG_INTERFACE to choose a different one)"
+                );
+            }
+        }
     }
 
     /// Remove peers that are disabled in the database but still present on the
@@ -625,6 +730,61 @@ impl Poller {
     }
 }
 
+/// Tracks the last reported poll scope so changes are logged once.
+#[derive(Debug, Default)]
+struct ScopeLog {
+    interface: Option<String>,
+    present: Option<bool>,
+    ignored: Option<Vec<String>>,
+}
+
+/// Which parts of the poll scope changed since the previous observation.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ScopeChanges {
+    /// The managed interface name is new or different.
+    interface: bool,
+    /// The managed interface appeared in or vanished from the dump.  On the
+    /// first observation only an absent interface counts as a change.
+    presence: bool,
+    /// The set of other interfaces changed.  On the first observation only a
+    /// non-empty set counts as a change.
+    ignored: bool,
+}
+
+impl ScopeLog {
+    fn observe(&mut self, managed: &str, present: bool, ignored: &[String]) -> ScopeChanges {
+        let changes = ScopeChanges {
+            interface: self.interface.as_deref() != Some(managed),
+            presence: match self.present {
+                None => !present,
+                Some(previous) => previous != present,
+            },
+            ignored: match &self.ignored {
+                None => !ignored.is_empty(),
+                Some(previous) => previous.as_slice() != ignored,
+            },
+        };
+        self.interface = Some(managed.to_string());
+        self.present = Some(present);
+        self.ignored = Some(ignored.to_vec());
+        changes
+    }
+}
+
+/// Resolve the managed interface name off the async executor.
+///
+/// Without an `AWG_INTERFACE` override this runs the privileged helper's
+/// `read-params` through `sudo`, which must not block a Tokio worker.
+async fn resolve_managed_interface(
+    interface: &InterfaceSelector,
+) -> Result<String, ManagedInterfaceError> {
+    let interface = interface.clone();
+    match tokio::task::spawn_blocking(move || interface.resolve()).await {
+        Ok(result) => result,
+        Err(e) => Err(ManagedInterfaceError::Task(e.to_string())),
+    }
+}
+
 /// Run blocking `awg show all dump` off the async executor.
 ///
 /// A hung or slow AWG command still occupies a blocking-pool thread until it
@@ -669,8 +829,15 @@ where
 ///
 /// Unlike the full poller cycle, this helper does not write traffic snapshots
 /// and does not touch config mapping; it only upserts the latest peer rows so
-/// UI pages can reflect lifecycle changes immediately.
-pub async fn sync_peers_from_awg(db: &crate::db::Database) -> anyhow::Result<()> {
+/// UI pages can reflect lifecycle changes immediately.  Like the poller, it
+/// only reads the managed interface.
+pub async fn sync_peers_from_awg(
+    db: &crate::db::Database,
+    interface: &InterfaceSelector,
+) -> anyhow::Result<()> {
+    let managed = resolve_managed_interface(interface)
+        .await
+        .context("cannot determine the managed AWG interface")?;
     let interfaces = match collect_awg_dump().await {
         Ok(ifaces) => ifaces,
         Err(awg::AwgError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -679,6 +846,7 @@ pub async fn sync_peers_from_awg(db: &crate::db::Database) -> anyhow::Result<()>
         }
         Err(e) => return Err(e.into()),
     };
+    let interfaces = scope_to_interface(interfaces, &managed).matched;
 
     let mut tx = db.pool.begin().await.context("begin sync_peers tx")?;
     for iface in &interfaces {
@@ -1343,6 +1511,173 @@ mod tests {
         assert_eq!(remaining_after.len(), 1);
 
         handle.abort();
+    }
+
+    /// A host with the installer's `awg0` and a hand-made `awg1`.
+    const TWO_INTERFACE_DUMP: &str = "\
+awg0\tPRIVATE0\tSERVER0_PUB=\t51820\toff\n\
+awg0\tMANAGED_PEER_A=\t(none)\t203.0.113.10:4000\t10.8.0.2/32\t1700000000\t10\t20\toff\n\
+awg0\tMANAGED_PEER_B=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
+awg1\tPRIVATE1\tSERVER1_PUB=\t51821\toff\n\
+awg1\tFOREIGN_PEER=\t(none)\t203.0.113.11:4001\t10.9.0.2/32\t1700000000\t30\t40\toff\n\
+";
+
+    async fn peer_exists(db: &Database, public_key: &str) -> bool {
+        crate::db::peers::find_by_public_key(&db.pool, public_key)
+            .await
+            .expect("find peer")
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn scoped_poll_batch_records_only_managed_interface_peers() {
+        let db = Database::connect_for_test().await.expect("test database");
+        let dump = awg::parse_dump(TWO_INTERFACE_DUMP).expect("parse dump");
+        let scoped = scope_to_interface(dump, "awg0");
+        assert_eq!(scoped.ignored, vec!["awg1".to_string()]);
+
+        let poller = Poller::new(db.clone(), 30, PathBuf::from("."));
+        let written = poller
+            .record_poll_batch(&scoped.matched, Utc::now())
+            .await
+            .expect("record scoped batch");
+        assert_eq!(written, 2);
+
+        assert!(peer_exists(&db, "MANAGED_PEER_A=").await);
+        assert!(peer_exists(&db, "MANAGED_PEER_B=").await);
+        assert!(!peer_exists(&db, "FOREIGN_PEER=").await);
+
+        let foreign_snapshots: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM snapshots WHERE public_key = ?")
+                .bind("FOREIGN_PEER=")
+                .fetch_one(&db.pool)
+                .await
+                .expect("count snapshots");
+        assert_eq!(foreign_snapshots, 0);
+    }
+
+    #[tokio::test]
+    async fn scoped_stale_cleanup_removes_peers_recorded_from_other_interfaces() {
+        let db = Database::connect_for_test().await.expect("test database");
+        let dump = awg::parse_dump(TWO_INTERFACE_DUMP).expect("parse dump");
+        let poller = Poller::new(db.clone(), 30, PathBuf::from("."));
+
+        // An earlier, unscoped poll recorded the foreign interface's peer.
+        poller
+            .record_poll_batch(&dump, Utc::now())
+            .await
+            .expect("record unscoped batch");
+        assert!(peer_exists(&db, "FOREIGN_PEER=").await);
+
+        let scoped = scope_to_interface(dump, "awg0");
+        poller
+            .remove_stale_peers(&scoped.matched)
+            .await
+            .expect("scoped stale cleanup");
+
+        assert!(!peer_exists(&db, "FOREIGN_PEER=").await);
+        assert!(peer_exists(&db, "MANAGED_PEER_A=").await);
+        assert!(peer_exists(&db, "MANAGED_PEER_B=").await);
+    }
+
+    #[tokio::test]
+    async fn scoped_stale_cleanup_is_skipped_while_managed_interface_is_down() {
+        let db = Database::connect_for_test().await.expect("test database");
+        let dump = awg::parse_dump(TWO_INTERFACE_DUMP).expect("parse dump");
+        let poller = Poller::new(db.clone(), 30, PathBuf::from("."));
+        poller
+            .record_poll_batch(&scope_to_interface(dump, "awg0").matched, Utc::now())
+            .await
+            .expect("record scoped batch");
+
+        // Only the foreign interface is up: the dump carries no managed peers,
+        // which must not be mistaken for "every managed peer was removed".
+        let only_foreign = awg::parse_dump(
+            "awg1\tPRIVATE1\tSERVER1_PUB=\t51821\toff\n\
+             awg1\tFOREIGN_PEER=\t(none)\t(none)\t10.9.0.2/32\t0\t0\t0\toff\n",
+        )
+        .expect("parse dump");
+        let scoped = scope_to_interface(only_foreign, "awg0");
+        assert!(scoped.matched.is_empty());
+        poller
+            .remove_stale_peers(&scoped.matched)
+            .await
+            .expect("cleanup skipped");
+
+        assert!(peer_exists(&db, "MANAGED_PEER_A=").await);
+        assert!(peer_exists(&db, "MANAGED_PEER_B=").await);
+    }
+
+    #[tokio::test]
+    async fn resolve_managed_interface_uses_override_without_params() {
+        let selector = InterfaceSelector::from_override(Some("awg1")).expect("valid override");
+        let resolved = resolve_managed_interface(&selector)
+            .await
+            .expect("override needs no params");
+        assert_eq!(resolved, "awg1");
+    }
+
+    #[test]
+    fn scope_log_reports_each_change_once() {
+        let mut log = ScopeLog::default();
+        let foreign = vec!["awg1".to_string()];
+
+        let first = log.observe("awg0", true, &foreign);
+        assert_eq!(
+            first,
+            ScopeChanges {
+                interface: true,
+                presence: false,
+                ignored: true,
+            }
+        );
+
+        let steady = log.observe("awg0", true, &foreign);
+        assert_eq!(steady, ScopeChanges::default());
+
+        let down = log.observe("awg0", false, &foreign);
+        assert_eq!(
+            down,
+            ScopeChanges {
+                interface: false,
+                presence: true,
+                ignored: false,
+            }
+        );
+
+        let alone = log.observe("awg0", true, &[]);
+        assert_eq!(
+            alone,
+            ScopeChanges {
+                interface: false,
+                presence: true,
+                ignored: true,
+            }
+        );
+
+        let switched = log.observe("awg1", true, &[]);
+        assert_eq!(
+            switched,
+            ScopeChanges {
+                interface: true,
+                presence: false,
+                ignored: false,
+            }
+        );
+    }
+
+    #[test]
+    fn scope_log_first_observation_warns_only_when_managed_interface_is_missing() {
+        let mut log = ScopeLog::default();
+        let first = log.observe("awg0", false, &[]);
+        assert_eq!(
+            first,
+            ScopeChanges {
+                interface: true,
+                presence: true,
+                ignored: false,
+            }
+        );
     }
 
     #[tokio::test]

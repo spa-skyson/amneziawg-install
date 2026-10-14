@@ -516,7 +516,17 @@ fn parse_client_mtu(value: &str) -> Result<Option<u16>, CreateClientError> {
     ))
 }
 
+/// Validate that `SERVER_AWG_NIC` is a safe AWG interface name.
+///
+/// See [`validate_interface_name_for`] for the rules.
+fn validate_interface_name(name: &str) -> Result<(), CreateClientError> {
+    validate_interface_name_for("SERVER_AWG_NIC", name).map_err(CreateClientError::ConfigParse)
+}
+
 /// Validate that a string is a safe AWG interface name.
+///
+/// `setting` names the configuration value in error messages (for example
+/// `SERVER_AWG_NIC` or `AWG_INTERFACE`).
 ///
 /// Rules (matching the install script's validation):
 /// - Non-empty
@@ -524,34 +534,25 @@ fn parse_client_mtu(value: &str) -> Result<Option<u16>, CreateClientError> {
 /// - Must not start with `-` (prevents option injection)
 /// - Less than 16 characters (Linux IFNAMSIZ)
 /// - Must not contain `..` (prevents path traversal)
-fn validate_interface_name(name: &str) -> Result<(), CreateClientError> {
+pub(crate) fn validate_interface_name_for(setting: &str, name: &str) -> Result<(), String> {
     if name.is_empty() {
-        return Err(CreateClientError::ConfigParse(
-            "SERVER_AWG_NIC must not be empty".into(),
-        ));
+        return Err(format!("{setting} must not be empty"));
     }
     if name.len() >= 16 {
-        return Err(CreateClientError::ConfigParse(
-            "SERVER_AWG_NIC must be less than 16 characters".into(),
-        ));
+        return Err(format!("{setting} must be less than 16 characters"));
     }
     if name.starts_with('-') {
-        return Err(CreateClientError::ConfigParse(
-            "SERVER_AWG_NIC must not start with '-'".into(),
-        ));
+        return Err(format!("{setting} must not start with '-'"));
     }
     if name.contains("..") {
-        return Err(CreateClientError::ConfigParse(
-            "SERVER_AWG_NIC must not contain '..'".into(),
-        ));
+        return Err(format!("{setting} must not contain '..'"));
     }
     if !name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
     {
-        return Err(CreateClientError::ConfigParse(
-            "SERVER_AWG_NIC contains invalid characters (only alphanumeric, _, ., - allowed)"
-                .into(),
+        return Err(format!(
+            "{setting} contains invalid characters (only alphanumeric, _, ., - allowed)"
         ));
     }
     Ok(())

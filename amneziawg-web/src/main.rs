@@ -9,6 +9,7 @@ mod config_store;
 mod db;
 mod domain;
 mod imitation;
+mod managed_interface;
 mod poller;
 mod system_versions;
 mod vpn_uri;
@@ -20,6 +21,7 @@ use tracing::info;
 
 use crate::auth::AuthConfig;
 use crate::db::Database;
+use crate::managed_interface::InterfaceSelector;
 use crate::poller::Poller;
 use crate::web::router_with_lifecycle_lock_dir;
 
@@ -46,6 +48,12 @@ pub struct Config {
     /// Polling interval in seconds.
     #[arg(long, env = "AWG_POLL_INTERVAL", default_value_t = 30)]
     pub poll_interval: u64,
+
+    /// AWG interface to monitor and manage.  Defaults to `SERVER_AWG_NIC`
+    /// from the installer params; set it only when this host runs several
+    /// AWG interfaces and the panel should follow a different one.
+    #[arg(long, env = "AWG_INTERFACE")]
+    pub interface: Option<String>,
 
     /// Snapshot retention window in days (up to 36500 days / ~100 years).
     /// In-window snapshots are kept, and each peer also keeps its newest older
@@ -197,6 +205,13 @@ async fn main() -> anyhow::Result<()> {
         info!(path = %p.display(), "config dir validated");
     }
 
+    // --- Managed AWG interface ---------------------------------------------
+    // AWG_INTERFACE pins the interface the poller and the enforcement helpers
+    // act on; otherwise SERVER_AWG_NIC from the installer params is used.  The
+    // value is passed to the privileged helper, so unsafe names are rejected
+    // before anything starts.
+    let interface = InterfaceSelector::from_override(config.interface.as_deref())?;
+
     if config.auth_enabled {
         if config.auth_password_hash.is_empty() {
             anyhow::bail!(
@@ -252,6 +267,7 @@ async fn main() -> anyhow::Result<()> {
         config.config_dir,
         lifecycle_lock_dir.clone(),
         config.snapshot_retention_days,
+        interface.clone(),
     );
     tokio::spawn(async move {
         poller.run().await;
@@ -264,6 +280,7 @@ async fn main() -> anyhow::Result<()> {
         config_dir,
         lifecycle_lock_dir,
         config.proxy_sessions_file,
+        interface,
     );
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
@@ -308,5 +325,20 @@ mod tests {
             Config::try_parse_from(["amneziawg-web", "--snapshot-retention-days", "200000",])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn config_accepts_optional_interface_override() {
+        let cfg = Config::try_parse_from(["amneziawg-web", "--interface", "awg1"])
+            .expect("parse interface");
+        assert_eq!(cfg.interface.as_deref(), Some("awg1"));
+
+        let selector = InterfaceSelector::from_override(cfg.interface.as_deref())
+            .expect("valid interface name");
+        assert_eq!(selector.override_name(), Some("awg1"));
+
+        let unsafe_cfg = Config::try_parse_from(["amneziawg-web", "--interface", "../etc"])
+            .expect("clap accepts any string; validation happens at startup");
+        assert!(InterfaceSelector::from_override(unsafe_cfg.interface.as_deref()).is_err());
     }
 }

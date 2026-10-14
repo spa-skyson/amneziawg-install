@@ -1192,6 +1192,18 @@ main() {
         } >>"${ENV_FILE}" && info "Added AWG_PROXY_SESSIONS_FILE to ${ENV_FILE}."
     fi
 
+    # Surface the optional interface override to existing installs without
+    # changing their behaviour: the hint stays commented out.
+    if [[ -f "${ENV_FILE}" ]] && ! grep -Eq '^[[:space:]]*#?[[:space:]]*AWG_INTERFACE=' "${ENV_FILE}" 2>/dev/null; then
+        {
+            printf '\n'
+            printf '# Optional: AWG interface to monitor and manage. Defaults to SERVER_AWG_NIC\n'
+            printf '# from the installer params; set it only when this host runs several AWG\n'
+            printf '# interfaces and the panel should follow a different one.\n'
+            printf '# AWG_INTERFACE=awg0\n'
+        } >>"${ENV_FILE}" && info "Added commented AWG_INTERFACE hint to ${ENV_FILE}."
+    fi
+
     if [[ -d /var/lib/amneziawg-proxy ]]; then
         chown root:"${SERVICE_USER}" /var/lib/amneziawg-proxy 2>/dev/null \
             && chmod 2750 /var/lib/amneziawg-proxy 2>/dev/null \

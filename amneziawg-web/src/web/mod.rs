@@ -38,6 +38,7 @@ use crate::domain::{
     normalize_comment, normalize_display_name, resolve_display_name, ConnectionStatus,
     IdentityStatus, PeerStatus, ONLINE_THRESHOLD_SECS,
 };
+use crate::managed_interface::{scope_to_interface, InterfaceSelector};
 use crate::system_versions::{ComponentVersions, RuntimeInfo, SystemVersions};
 
 // ── App state ────────────────────────────────────────────────────────────────
@@ -58,6 +59,8 @@ pub struct AppState {
     pub lifecycle_lock_dir: PathBuf,
     /// Local JSON file written by amneziawg-proxy with active session status.
     pub proxy_sessions_file: PathBuf,
+    /// Which AWG interface the enforcement helpers and one-shot syncs act on.
+    pub interface: InterfaceSelector,
     /// Lazily-canonicalized `config_dir` for safe `starts_with` comparisons.
     /// Populated on first successful canonicalization (either at startup or on
     /// the first request that triggers it), so that a `config_dir` created
@@ -131,12 +134,19 @@ impl AppState {
             config_dir,
             lifecycle_lock_dir,
             proxy_sessions_file,
+            interface: InterfaceSelector::from_params(),
             canonical_config_dir: std::sync::Arc::new(cell),
             logged_canon_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             system_versions_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             system_booted_at,
             system_uptime_baseline,
         }
+    }
+
+    /// Pin the AWG interface the enforcement helpers act on.
+    fn with_interface(mut self, interface: InterfaceSelector) -> Self {
+        self.interface = interface;
+        self
     }
 
     /// Return the canonicalized config directory, computing it lazily if
@@ -1180,6 +1190,7 @@ pub fn router_with_proxy_sessions_file(
         config_dir.clone(),
         config_dir,
         proxy_sessions_file,
+        InterfaceSelector::from_params(),
     )
 }
 
@@ -1190,6 +1201,7 @@ pub fn router_with_lifecycle_lock_dir(
     config_dir: PathBuf,
     lifecycle_lock_dir: PathBuf,
     proxy_sessions_file: PathBuf,
+    interface: InterfaceSelector,
 ) -> Router {
     let state = AppState::new(
         db,
@@ -1197,7 +1209,8 @@ pub fn router_with_lifecycle_lock_dir(
         config_dir,
         lifecycle_lock_dir,
         proxy_sessions_file,
-    );
+    )
+    .with_interface(interface);
 
     // Protected routes – all require a valid session.
     let protected = Router::new()
@@ -2302,12 +2315,12 @@ async fn patch_peer(
             // Immediately remove the peer from the running AWG interface so
             // the client cannot connect until re-enabled.
             if disabled {
-                remove_peer_from_interface(&existing.public_key);
+                remove_peer_from_interface(&state.interface, &existing.public_key);
             } else {
                 // Re-add the peer to the running AWG interface by syncing
                 // the on-disk config (with disabled peers pre-filtered so
                 // syncconf never reactivates them).
-                restore_peer_best_effort(&state.db.pool).await;
+                restore_peer_best_effort(&state.interface, &state.db.pool).await;
             }
         }
     }
@@ -2703,12 +2716,12 @@ async fn post_peer_edit(
         // Immediately remove the peer from the running AWG interface so
         // the client cannot connect until re-enabled.
         if new_disabled {
-            remove_peer_from_interface(&existing.public_key);
+            remove_peer_from_interface(&state.interface, &existing.public_key);
         } else {
             // Re-add the peer to the running AWG interface by syncing
             // the on-disk config (with disabled peers pre-filtered so
             // syncconf never reactivates them).
-            restore_peer_best_effort(&state.db.pool).await;
+            restore_peer_best_effort(&state.interface, &state.db.pool).await;
         }
     }
 
@@ -3460,7 +3473,7 @@ async fn post_remove_user_form(
 /// This avoids waiting for the next background poll cycle before newly added
 /// users appear in the web UI.
 async fn refresh_peer_state_after_lifecycle(state: &AppState) {
-    if let Err(e) = crate::poller::sync_peers_from_awg(&state.db).await {
+    if let Err(e) = crate::poller::sync_peers_from_awg(&state.db, &state.interface).await {
         tracing::warn!(error = %e, "post-lifecycle peer sync failed");
     }
     if let Err(e) = crate::poller::rescan_configs(&state.db, &state.config_dir).await {
@@ -3470,16 +3483,29 @@ async fn refresh_peer_state_after_lifecycle(state: &AppState) {
 
 // ── AWG enforcement helpers ───────────────────────────────────────────────────
 
-/// Best-effort immediate removal of a peer from the running AWG interface.
+/// Best-effort immediate removal of a peer from the managed AWG interface.
 ///
 /// Spawns the blocking AWG commands (`show all dump` + `set … peer … remove`)
 /// on a dedicated blocking thread via `tokio::task::spawn_blocking` so the
-/// calling async handler stays non-blocking.  The task is fire-and-forget:
-/// errors are logged but never propagated – the database is already updated,
-/// and the poller will retry removal on the next cycle.
-fn remove_peer_from_interface(public_key: &str) {
+/// calling async handler stays non-blocking.  Only the managed interface is
+/// touched; other AWG interfaces on the host are left alone.  The task is
+/// fire-and-forget: errors are logged but never propagated – the database is
+/// already updated, and the poller will retry removal on the next cycle.
+fn remove_peer_from_interface(interface: &InterfaceSelector, public_key: &str) {
+    let interface = interface.clone();
     let pk = public_key.to_owned();
     tokio::task::spawn_blocking(move || {
+        let managed = match interface.resolve() {
+            Ok(name) => name,
+            Err(e) => {
+                tracing::warn!(
+                    public_key = %pk,
+                    error = %e,
+                    "could not determine the managed AWG interface for immediate peer removal – poller will retry"
+                );
+                return;
+            }
+        };
         let interfaces = match crate::awg::show_all_dump() {
             Ok(ifaces) => ifaces,
             Err(e) => {
@@ -3492,7 +3518,7 @@ fn remove_peer_from_interface(public_key: &str) {
             }
         };
 
-        for iface in &interfaces {
+        for iface in &scope_to_interface(interfaces, &managed).matched {
             if iface.peers.iter().any(|p| p.public_key.0 == pk) {
                 match crate::awg::remove_peer(&iface.name, &pk) {
                     Ok(()) => {
@@ -3520,10 +3546,10 @@ fn remove_peer_from_interface(public_key: &str) {
 ///
 /// Fails closed: if the disabled keys cannot be loaded, the sync is skipped
 /// entirely so that disabled peers are never accidentally reactivated.
-async fn restore_peer_best_effort(pool: &sqlx::SqlitePool) {
+async fn restore_peer_best_effort(interface: &InterfaceSelector, pool: &sqlx::SqlitePool) {
     match crate::db::peers::list_disabled_public_keys(pool).await {
         Ok(disabled_keys) => {
-            restore_peer_to_interface(disabled_keys);
+            restore_peer_to_interface(interface, disabled_keys);
         }
         Err(e) => {
             tracing::warn!(
@@ -3534,14 +3560,15 @@ async fn restore_peer_best_effort(pool: &sqlx::SqlitePool) {
     }
 }
 
-/// Best-effort immediate reconciliation of the running AWG interface with the
+/// Best-effort immediate reconciliation of the managed AWG interface with the
 /// on-disk config.
 ///
 /// Spawns blocking AWG commands on a dedicated thread:
-/// 1. `awg show all dump` to discover active interfaces.
-/// 2. For each interface, `awg-quick strip <iface>` → filter out disabled
-///    peers → `awg syncconf <iface>` to fully reconcile the running
-///    interface with the (filtered) on-disk config.
+/// 1. `awg show all dump` to check that the managed interface is up; other
+///    AWG interfaces on the host are never reconciled.
+/// 2. `awg-quick strip <iface>` → filter out disabled peers →
+///    `awg syncconf <iface>` to fully reconcile the running interface with
+///    the (filtered) on-disk config.
 ///
 /// **Important:** `syncconf` performs a full reconciliation — it adds peers
 /// present in the config but missing from the interface, removes peers
@@ -3553,8 +3580,22 @@ async fn restore_peer_best_effort(pool: &sqlx::SqlitePool) {
 /// Like [`remove_peer_from_interface`], this is fire-and-forget: errors are
 /// logged but never propagated.  If this best-effort restore fails, the peer
 /// will not be auto-synced; it will become active on the next AWG restart.
-fn restore_peer_to_interface(disabled_keys: std::collections::HashSet<String>) {
+fn restore_peer_to_interface(
+    interface: &InterfaceSelector,
+    disabled_keys: std::collections::HashSet<String>,
+) {
+    let interface = interface.clone();
     tokio::task::spawn_blocking(move || {
+        let managed = match interface.resolve() {
+            Ok(name) => name,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not determine the managed AWG interface for peer restoration – skipping best-effort restore; peer will not be auto-synced"
+                );
+                return;
+            }
+        };
         let interfaces = match crate::awg::show_all_dump() {
             Ok(ifaces) => ifaces,
             Err(e) => {
@@ -3566,7 +3607,7 @@ fn restore_peer_to_interface(disabled_keys: std::collections::HashSet<String>) {
             }
         };
 
-        for iface in &interfaces {
+        for iface in &scope_to_interface(interfaces, &managed).matched {
             match crate::awg::sync_interface(&iface.name, &disabled_keys) {
                 Ok(()) => {
                     tracing::info!(
