@@ -472,6 +472,29 @@ if [[ -f /etc/amnezia/amneziawg/params ]]; then
 		FAILED=$((FAILED + 1))
 	fi
 
+	# Without CLIENT_MTU in the environment, AUTO_INSTALL persists the S4-aware
+	# default for a 1500-byte path, 1420 minus S4 and at least 1280, for CLI
+	# and web panel clients (issue #120). The server interface below starts
+	# from the MTU of the uplink NIC instead.
+	EXPECTED_CLIENT_MTU=""
+	EXPECTED_SERVER_MTU=""
+	if [[ "${SERVER_AWG_S4:-}" =~ ^[0-9]+$ ]]; then
+		EXPECTED_CLIENT_MTU=$((1420 - SERVER_AWG_S4))
+		(( EXPECTED_CLIENT_MTU >= 1280 )) || EXPECTED_CLIENT_MTU=1280
+		UPLINK_MTU=$(cat "/sys/class/net/${SERVER_PUB_NIC:-none}/mtu" 2>/dev/null || true)
+		if ! [[ "${UPLINK_MTU}" =~ ^[0-9]+$ ]] || (( UPLINK_MTU < 1280 )); then
+			UPLINK_MTU=1500
+		fi
+		EXPECTED_SERVER_MTU=$((UPLINK_MTU - 80 - SERVER_AWG_S4))
+		(( EXPECTED_SERVER_MTU >= 1280 )) || EXPECTED_SERVER_MTU=1280
+	fi
+	if [[ -n "${EXPECTED_CLIENT_MTU}" ]] && [[ "${CLIENT_MTU:-}" == "${EXPECTED_CLIENT_MTU}" ]]; then
+		echo "  OK: CLIENT_MTU=${CLIENT_MTU} is 1420 minus S4=${SERVER_AWG_S4}"
+	else
+		echo "  FAIL: CLIENT_MTU='${CLIENT_MTU:-}' is not 1420 minus S4='${SERVER_AWG_S4:-}' (expected '${EXPECTED_CLIENT_MTU}')"
+		FAILED=$((FAILED + 1))
+	fi
+
 	if [[ "${AWG_PROTOCOL_VERSION:-}" == "2" ]] && \
 		[[ -z "${AWG_HEADER_PROTECTION_KEY:-}" ]] && \
 		[[ -z "${AWG_CONTENT_PADDING_ADDITION:-}" ]] && \
@@ -519,6 +542,18 @@ if [[ -f "${SERVER_CONF}" ]]; then
 		FAILED=$((FAILED + 1))
 	else
 		echo "  OK: Fresh AWG 2.0 server config omits AWG 3.x-only fields"
+	fi
+
+	# The interface MTU allows for the S4 junk bytes AmneziaWG prepends to
+	# every transport packet, which awg-quick's automatic MTU, the uplink MTU
+	# minus 80, does not (issue #120): uplink MTU minus 80 minus S4, at least 1280.
+	SERVER_S4=$(grep "^S4 = " "${SERVER_CONF}" | sed 's/^S4 = //')
+	SERVER_MTU=$(grep "^MTU = " "${SERVER_CONF}" | sed 's/^MTU = //')
+	if [[ -n "${EXPECTED_SERVER_MTU:-}" ]] && [[ "${SERVER_MTU}" == "${EXPECTED_SERVER_MTU}" ]] && [[ "${SERVER_S4}" == "${SERVER_AWG_S4}" ]]; then
+		echo "  OK: MTU=${SERVER_MTU} allows for S4=${SERVER_S4} on the ${UPLINK_MTU:-}-byte uplink ${SERVER_PUB_NIC:-} (uplink MTU minus 80 minus S4, at least 1280)"
+	else
+		echo "  FAIL: MTU='${SERVER_MTU}' with S4='${SERVER_S4}' (expected MTU '${EXPECTED_SERVER_MTU:-}' for S4 '${SERVER_AWG_S4:-}' on the ${UPLINK_MTU:-}-byte uplink)"
+		FAILED=$((FAILED + 1))
 	fi
 
 	# Verify the native nftables firewall rules were generated (issue #79).
@@ -731,6 +766,15 @@ if [[ -n "${CLIENT_CONF}" ]] && [[ -f "${CLIENT_CONF}" ]]; then
 		fi
 	else
 		echo "  FAIL: S3=${C_S3} or S4=${C_S4} out of range [15-150]"
+		FAILED=$((FAILED + 1))
+	fi
+
+	# The client MTU is the persisted S4-aware default for a 1500-byte path (issue #120)
+	C_MTU=$(grep "^MTU = " "${CLIENT_CONF}" | sed 's/^MTU = //')
+	if [[ -n "${EXPECTED_CLIENT_MTU:-}" ]] && [[ "${C_MTU}" == "${EXPECTED_CLIENT_MTU}" ]]; then
+		echo "  OK: MTU=${C_MTU} matches 1420 minus S4=${C_S4}"
+	else
+		echo "  FAIL: client MTU='${C_MTU}' (expected '${EXPECTED_CLIENT_MTU:-}' for S4=${C_S4})"
 		FAILED=$((FAILED + 1))
 	fi
 
