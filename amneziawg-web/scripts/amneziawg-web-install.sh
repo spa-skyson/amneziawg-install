@@ -1902,6 +1902,11 @@ AWG_WEB_DB=${DATA_DIR}/awg-web.db
 # ── AWG integration ───────────────────────────────────────────────────────────
 AWG_CONFIG_DIR=${AWG_CONFIG_DIR}
 AWG_POLL_INTERVAL=${POLL_INTERVAL}
+# Optional: AWG interface to follow. Defaults to SERVER_AWG_NIC from the
+# installer params; set it only when this host runs several AWG interfaces and
+# the panel should follow a different one. Any other interface is monitored
+# only (no client, peer or protocol management).
+# AWG_INTERFACE=awg0
 AWG_SNAPSHOT_RETENTION_DAYS=${SNAPSHOT_RETENTION_DAYS}
 AWG_PROXY_SESSIONS_FILE=/var/lib/amneziawg-proxy/sessions.json
 ENVEOF

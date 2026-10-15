@@ -4,23 +4,30 @@
 //! between the *start* of consecutive cycles is `interval` seconds, regardless
 //! of how long each cycle takes.
 //!
-//! 1. Calls `awg::show_all_dump()` on a blocking thread – reads current AWG state.
+//! 0. Resolves the panel mode: which interface this instance follows
+//!    (`AWG_INTERFACE`, else `SERVER_AWG_NIC` from the installer params) and
+//!    whether it may manage it.  An override naming an interface the installer
+//!    does not manage puts the panel into monitoring-only mode.
+//! 1. Calls `awg::show_all_dump()` on a blocking thread – reads current AWG state
+//!    and keeps only the followed interface.  Other interfaces on the host are
+//!    ignored.
 //! 2. Writes a snapshot row per peer into `snapshots`.
 //! 3. Upserts each peer into the `peers` table.
 //!    3b. Removes disabled peers from the running AWG interface
-//!    (`awg set <iface> peer <key> remove`).  This is a self-healing
-//!    safety net; immediate removal also happens at toggle time.
+//!    (`awg set <iface> peer <key> remove`; management mode only).  This is a
+//!    self-healing safety net; immediate removal also happens at toggle time.
 //! 4. Scans the config directory for `*.conf` files.
 //! 5. Applies config-to-peer mapping (sets `has_config`, `config_name`,
 //!    `config_path` on matching peers).
 //! 6. Removes stale peers – DB rows for non-disabled peers whose public
-//!    keys no longer appear on any AWG interface.  This cleans up
-//!    artifacts left when peers are removed outside the web panel.
+//!    keys no longer appear on the managed AWG interface.  This cleans up
+//!    artifacts left when peers are removed outside the web panel, and rows
+//!    recorded from other interfaces before the poller was scoped.
 //!
 //! Errors within a single cycle step are logged and the cycle continues;
 //! the overall polling loop never stops due to a single-cycle failure.
-//! Expired managed users are removed before each AWG snapshot, including the
-//! poller's immediate first cycle at process startup.
+//! In management mode, expired managed users are removed before each AWG
+//! snapshot, including the poller's immediate first cycle at process startup.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -34,6 +41,9 @@ use crate::awg;
 use crate::config_store;
 use crate::db::Database;
 use crate::domain::PublicKey;
+use crate::managed_interface::{
+    scope_to_interface, InterfaceSelector, PanelMode, ScopedInterfaces,
+};
 
 /// Serializes access to the clear-all + re-map sequence so that concurrent
 /// calls from the poller and on-demand `rescan_configs` cannot interleave, and
@@ -60,12 +70,24 @@ pub struct Poller {
     lifecycle_lock_dir: PathBuf,
     /// Maximum age of snapshots in days before cleanup (0 = disabled).
     snapshot_retention_days: u32,
+    /// Which AWG interface the poller records and enforces.
+    interface: InterfaceSelector,
+    /// Last reported interface scope, so changes are logged once rather than
+    /// on every cycle.
+    scope_log: std::sync::Arc<std::sync::Mutex<ScopeLog>>,
 }
 
 impl Poller {
     #[cfg(test)]
     pub fn new(db: Database, interval_secs: u64, config_dir: PathBuf) -> Self {
-        Self::new_full(db, interval_secs, config_dir.clone(), config_dir, 0)
+        Self::new_full(
+            db,
+            interval_secs,
+            config_dir.clone(),
+            config_dir,
+            0,
+            InterfaceSelector::from_params(),
+        )
     }
 
     pub fn new_full(
@@ -74,6 +96,7 @@ impl Poller {
         config_dir: PathBuf,
         lifecycle_lock_dir: PathBuf,
         snapshot_retention_days: u32,
+        interface: InterfaceSelector,
     ) -> Self {
         Self {
             db,
@@ -81,6 +104,8 @@ impl Poller {
             config_dir,
             lifecycle_lock_dir,
             snapshot_retention_days,
+            interface,
+            scope_log: std::sync::Arc::new(std::sync::Mutex::new(ScopeLog::default())),
         }
     }
 
@@ -92,6 +117,16 @@ impl Poller {
 
     /// Run the polling loop and independent retention task forever.
     pub async fn run(&self) {
+        match self.interface.override_name() {
+            Some(interface) => info!(
+                interface,
+                "poller scoped to the AWG interface set by AWG_INTERFACE"
+            ),
+            None => info!(
+                "poller scoped to SERVER_AWG_NIC from the installer params (set AWG_INTERFACE to override)"
+            ),
+        }
+
         if self.snapshot_retention_days > 0 {
             info!(
                 interval_secs = self.interval.as_secs(),
@@ -157,26 +192,32 @@ impl Poller {
         let start = std::time::Instant::now();
         debug!("poll cycle starting");
 
-        // ── Step 0: Expired-user cleanup ────────────────────────────────────
+        // ── Step 0: Panel mode ───────────────────────────────────────────────
+        // Resolve which interface this instance follows and whether it may
+        // manage it.  This reads the installer params through the privileged
+        // helper – a blocking `sudo` call, run off the async executor like the
+        // dump itself.  Without a name there is nothing safe to scope the
+        // dump to, so the cycle's AWG steps are skipped.
+        let mode = match self.interface.resolve_mode_off_thread().await {
+            Ok(mode) => mode,
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "cannot determine the managed AWG interface – skipping poll cycle"
+                );
+                return Err(e.into());
+            }
+        };
+        self.log_mode(&mode);
+        let managed = mode.interface();
+
+        // ── Step 0b: Expired-user cleanup ────────────────────────────────────
         // The first interval tick fires immediately, so this also catches
         // expirations missed while the web service was stopped. Running it
         // before AWG discovery means cleanup is still attempted if AWG status
-        // collection fails later in the cycle.
-        match crate::admin::cleanup_expired_users(
-            &self.db,
-            &self.config_dir,
-            &self.lifecycle_lock_dir,
-        )
-        .await
-        {
-            Ok(removed) if removed > 0 => {
-                info!(removed, "expired-user cleanup complete");
-            }
-            Ok(_) => {}
-            Err(e) => {
-                error!(error = %e, "expired-user cleanup query failed – continuing");
-            }
-        }
+        // collection fails later in the cycle.  Removal rewrites the
+        // installer's server config, so it only runs in management mode.
+        self.cleanup_expired_users_step(&mode).await;
 
         // ── Step 1–3: AWG data ───────────────────────────────────────────────
         // `awg show all dump` is a blocking process; run it off the async
@@ -194,10 +235,22 @@ impl Poller {
             }
         };
 
+        // Every other interface on the host is dropped here, so snapshots,
+        // upserts, disabled-peer enforcement and stale-peer cleanup below only
+        // ever see the managed interface.
+        let ScopedInterfaces {
+            matched: interfaces,
+            ignored,
+        } = scope_to_interface(interfaces, managed);
+        self.log_scope(managed, !interfaces.is_empty(), &ignored);
+
         let peer_count: usize = interfaces.iter().map(|i| i.peers.len()).sum();
         info!(
+            interface = %managed,
             interface_count = interfaces.len(),
-            peer_count, "awg data retrieved"
+            ignored_interface_count = ignored.len(),
+            peer_count,
+            "awg data retrieved"
         );
 
         let now = chrono::Utc::now();
@@ -220,9 +273,17 @@ impl Poller {
         // on the running AWG interface.  This is a self-healing safety net:
         // immediate removal also happens at toggle time (web/admin handlers),
         // but the poller ensures eventual consistency (e.g. after an AWG
-        // restart that re-reads the on-disk config).
-        if let Err(e) = self.enforce_disabled_peers(&interfaces).await {
-            error!(error = %e, "enforce-disabled step failed – continuing");
+        // restart that re-reads the on-disk config).  A monitoring-only
+        // instance never changes the interface it follows.
+        if mode.is_managing() {
+            if let Err(e) = self.enforce_disabled_peers(&interfaces).await {
+                error!(error = %e, "enforce-disabled step failed – continuing");
+            }
+        } else {
+            debug!(
+                interface = %managed,
+                "monitoring-only mode – disabled peers are not removed from the interface"
+            );
         }
 
         // ── Step 4–5: Config mapping ─────────────────────────────────────────
@@ -244,6 +305,104 @@ impl Poller {
             "poll cycle complete"
         );
         Ok(())
+    }
+
+    /// Remove due managed users, unless this instance only monitors its
+    /// interface: removal rewrites the installer's server config and
+    /// reconciles the installer's interface, which may be a different one.
+    async fn cleanup_expired_users_step(&self, mode: &PanelMode) {
+        if !mode.is_managing() {
+            debug!(
+                interface = %mode.interface(),
+                "monitoring-only mode – expired-user cleanup skipped"
+            );
+            return;
+        }
+        match crate::admin::cleanup_expired_users(
+            &self.db,
+            &self.config_dir,
+            &self.lifecycle_lock_dir,
+        )
+        .await
+        {
+            Ok(removed) if removed > 0 => {
+                info!(removed, "expired-user cleanup complete");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                error!(error = %e, "expired-user cleanup query failed – continuing");
+            }
+        }
+    }
+
+    /// Log the panel mode once at startup and again whenever it changes.
+    fn log_mode(&self, mode: &PanelMode) {
+        let previous = match self.scope_log.lock() {
+            Ok(mut state) => state.observe_mode(mode),
+            Err(poisoned) => poisoned.into_inner().observe_mode(mode),
+        };
+        let Some(previous) = previous else {
+            return;
+        };
+        match mode {
+            PanelMode::MonitoringOnly {
+                monitored,
+                installer,
+            } => warn!(
+                monitored = %monitored,
+                installer = installer.as_deref().unwrap_or("(params unreadable)"),
+                "monitoring-only mode: this panel instance only records its interface; client, peer and protocol management are unavailable"
+            ),
+            PanelMode::Managing { interface } => {
+                if previous.is_some() {
+                    info!(
+                        interface = %interface,
+                        "management mode restored: the followed interface is the installer's"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Report scope changes: the monitored interface (at startup and whenever
+    /// it changes), whether it is present in the dump, and which other
+    /// interfaces the host carries.  Logging only on change keeps a
+    /// permanently present foreign interface from producing a warning on
+    /// every cycle.
+    fn log_scope(&self, managed: &str, present: bool, ignored: &[String]) {
+        let changes = match self.scope_log.lock() {
+            Ok(mut state) => state.observe(managed, present, ignored),
+            Err(poisoned) => poisoned.into_inner().observe(managed, present, ignored),
+        };
+
+        if changes.interface {
+            info!(
+                interface = %managed,
+                source = self.interface.source(),
+                "monitoring AWG interface"
+            );
+        }
+        if changes.presence {
+            if present {
+                info!(interface = %managed, "managed AWG interface is present again");
+            } else {
+                warn!(
+                    interface = %managed,
+                    "managed AWG interface is not present in the dump – peers are left untouched until it is up"
+                );
+            }
+        }
+        if changes.ignored {
+            if ignored.is_empty() {
+                info!(interface = %managed, "no other AWG interfaces present any more");
+            } else {
+                warn!(
+                    interface = %managed,
+                    ignored = ?ignored,
+                    "AWG dump contains other interfaces – they are not monitored by this panel (set AWG_INTERFACE to choose a different one)"
+                );
+            }
+        }
     }
 
     /// Remove peers that are disabled in the database but still present on the
@@ -330,9 +489,7 @@ impl Poller {
     ///
     /// This operation is idempotent:
     /// 1. All config-mapping fields are first reset to NULL / 0 for every peer.
-    /// 2. Each discovered config file is matched to a peer by `public_key`
-    ///    first; if no key match is found, a fallback match via AllowedIPs
-    ///    is attempted.
+    /// 2. Configs owned by the selected server are matched by client address.
     ///
     /// If the config directory cannot be read, a warning is logged and the
     /// step returns `Ok(())` — existing config-mapping fields are **not**
@@ -371,7 +528,8 @@ impl Poller {
             "config scan complete"
         );
 
-        apply_config_mappings(&self.db, &configs).await
+        let scope = self.interface.config_scope().await?;
+        apply_config_mappings(&self.db, &configs, scope.as_ref()).await
     }
 
     /// Purge snapshots older than `snapshot_retention_days` (if configured > 0).
@@ -454,6 +612,7 @@ impl Poller {
         interfaces: &[awg::AwgInterface],
         now: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<usize> {
+        self.interface.observe_interfaces(interfaces);
         let mut tx = self
             .db
             .pool
@@ -625,6 +784,57 @@ impl Poller {
     }
 }
 
+/// Tracks the last reported poll scope so changes are logged once.
+#[derive(Debug, Default)]
+struct ScopeLog {
+    mode: Option<PanelMode>,
+    interface: Option<String>,
+    present: Option<bool>,
+    ignored: Option<Vec<String>>,
+}
+
+/// Which parts of the poll scope changed since the previous observation.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ScopeChanges {
+    /// The managed interface name is new or different.
+    interface: bool,
+    /// The managed interface appeared in or vanished from the dump.  On the
+    /// first observation only an absent interface counts as a change.
+    presence: bool,
+    /// The set of other interfaces changed.  On the first observation only a
+    /// non-empty set counts as a change.
+    ignored: bool,
+}
+
+impl ScopeLog {
+    fn observe(&mut self, managed: &str, present: bool, ignored: &[String]) -> ScopeChanges {
+        let changes = ScopeChanges {
+            interface: self.interface.as_deref() != Some(managed),
+            presence: match self.present {
+                None => !present,
+                Some(previous) => previous != present,
+            },
+            ignored: match &self.ignored {
+                None => !ignored.is_empty(),
+                Some(previous) => previous.as_slice() != ignored,
+            },
+        };
+        self.interface = Some(managed.to_string());
+        self.present = Some(present);
+        self.ignored = Some(ignored.to_vec());
+        changes
+    }
+
+    /// Record the panel mode.  Returns the previous value when it changed
+    /// (`Some(None)` on the first observation) and `None` when unchanged.
+    fn observe_mode(&mut self, mode: &PanelMode) -> Option<Option<PanelMode>> {
+        if self.mode.as_ref() == Some(mode) {
+            return None;
+        }
+        Some(self.mode.replace(mode.clone()))
+    }
+}
+
 /// Run blocking `awg show all dump` off the async executor.
 ///
 /// A hung or slow AWG command still occupies a blocking-pool thread until it
@@ -669,8 +879,16 @@ where
 ///
 /// Unlike the full poller cycle, this helper does not write traffic snapshots
 /// and does not touch config mapping; it only upserts the latest peer rows so
-/// UI pages can reflect lifecycle changes immediately.
-pub async fn sync_peers_from_awg(db: &crate::db::Database) -> anyhow::Result<()> {
+/// UI pages can reflect lifecycle changes immediately.  Like the poller, it
+/// only reads the managed interface.
+pub async fn sync_peers_from_awg(
+    db: &crate::db::Database,
+    interface: &InterfaceSelector,
+) -> anyhow::Result<()> {
+    let mode = interface
+        .resolve_mode_off_thread()
+        .await
+        .context("cannot determine the managed AWG interface")?;
     let interfaces = match collect_awg_dump().await {
         Ok(ifaces) => ifaces,
         Err(awg::AwgError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -679,6 +897,8 @@ pub async fn sync_peers_from_awg(db: &crate::db::Database) -> anyhow::Result<()>
         }
         Err(e) => return Err(e.into()),
     };
+    let interfaces = scope_to_interface(interfaces, mode.interface()).matched;
+    interface.observe_interfaces(&interfaces);
 
     let mut tx = db.pool.begin().await.context("begin sync_peers tx")?;
     for iface in &interfaces {
@@ -724,99 +944,62 @@ fn saturating_u64_to_i64(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
 }
 
-/// Extract the base IP address from a CIDR string (e.g. `"10.8.0.2/32"` → `"10.8.0.2"`).
-fn base_ip(cidr: &str) -> &str {
-    cidr.split('/').next().unwrap_or(cidr)
-}
-
 /// Shared config-to-peer mapping logic used by both the poller cycle and
-/// on-demand rescan.  Resets all mappings, then applies Strategy 1 (public-key)
-/// and Strategy 2 (AllowedIPs fallback) for each config.
+/// on-demand rescan. Requires server ownership before matching client addresses.
 ///
 /// Callers hold [`CONFIG_MAPPING_LOCK`] across both their directory scan and
 /// this clear-and-remap sequence.
 async fn apply_config_mappings(
     db: &crate::db::Database,
     configs: &[config_store::ClientConfig],
+    scope: Option<&crate::managed_interface::ConfigScope>,
 ) -> anyhow::Result<()> {
     // Reset all mapping fields so that removed configs don't persist.
     crate::db::peers::clear_all_config_mappings(&db.pool).await?;
 
-    // Load all peers from the DB for AllowedIPs fallback matching.
+    let Some(scope) = scope else { return Ok(()) };
+
+    // Include disabled/offline managed peers; monitoring is restricted below
+    // to peers observed on the selected interface.
     let all_peers = crate::db::peers::list_visible(&db.pool).await?;
 
-    let mut mapped: usize = 0;
     let mut mapped_by_ip: usize = 0;
-    for config in configs {
-        let path_str = config.path.to_string_lossy();
-        let managed_client_name = crate::admin::script_bridge::managed_client_name_from_config(
-            &config.name,
-            &config.friendly_name,
-        );
-
-        // ── Strategy 1: exact public-key match ──────────────────
-        //
-        // The `[Peer] PublicKey` in a client config refers to the
-        // *server's* key, so it will only match a peer whose public
-        // key happens to equal that value (i.e. if the config dir
-        // also contains server-side configs).  If no peer matches,
-        // we fall through to Strategy 2 instead of giving up.
-        if let Some(pk) = &config.peer_public_key {
-            match crate::db::peers::apply_config_mapping(
-                &db.pool,
-                &pk.0,
-                &config.name,
-                &path_str,
-                &config.friendly_name,
-                managed_client_name,
-            )
-            .await
-            {
-                Ok(true) => {
-                    mapped += 1;
-                    debug!(
-                        config = %config.name,
-                        friendly_name = %config.friendly_name,
-                        public_key = %pk,
-                        "config linked by public key"
-                    );
-                    continue;
-                }
-                Ok(false) => {
-                    // No peer matched this public key (common: the key
-                    // in a client config is normally the server's key).
-                    // Fall through to AllowedIPs matching.
-                    debug!(
-                        config = %config.name,
-                        public_key = %pk,
-                        "no peer matched [Peer] PublicKey – trying AllowedIPs fallback"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        config = %config.name,
-                        public_key = %pk,
-                        error = %e,
-                        "failed to apply config mapping – skipping"
-                    );
-                    continue;
-                }
+    // Live peers of a monitoring-only interface cannot have an installer
+    // lifecycle identity. Repair values assigned by older unscoped discovery
+    // without touching operator labels, comments or unrelated retained rows.
+    if !scope.mode.is_managing() {
+        for peer in &all_peers {
+            if scope.permits_peer(&peer.public_key) {
+                sqlx::query("UPDATE peers SET managed_client_name = NULL WHERE id = ?")
+                    .bind(peer.id)
+                    .execute(&db.pool)
+                    .await?;
             }
         }
+    }
+    for config in configs {
+        if !config.belongs_to(scope) {
+            continue;
+        }
+        let path_str = config.path.to_string_lossy();
+        let managed_client_name = scope
+            .mode
+            .is_managing()
+            .then(|| {
+                crate::admin::script_bridge::managed_client_name_from_config(
+                    &config.name,
+                    &config.friendly_name,
+                )
+            })
+            .flatten();
 
-        // ── Strategy 2: AllowedIPs fallback ─────────────────────
         // Attempt to match by comparing the config's Address field
         // with peer AllowedIPs.  Only match if unambiguous (exactly one).
         if !config.addresses.is_empty() {
             let candidates: Vec<_> = all_peers
                 .iter()
                 .filter(|p| {
-                    config.addresses.iter().any(|addr| {
-                        let addr_base = base_ip(addr);
-                        p.allowed_ips
-                            .split(',')
-                            .any(|a| base_ip(a.trim()) == addr_base)
-                    })
+                    scope.permits_peer(&p.public_key) && config.matches_addresses(&p.allowed_ips)
                 })
                 .collect();
 
@@ -838,7 +1021,7 @@ async fn apply_config_mappings(
                             config = %config.name,
                             friendly_name = %config.friendly_name,
                             public_key = %peer.public_key,
-                            "config linked by AllowedIPs fallback"
+                            "owned config linked by client address"
                         );
                     }
                     Ok(false) => {
@@ -865,20 +1048,19 @@ async fn apply_config_mappings(
             } else {
                 debug!(
                     config = %config.name,
-                    "no [Peer] PublicKey and no AllowedIPs match – skipping"
+                    "no matching peer address – skipping config mapping"
                 );
             }
         } else {
             debug!(
                 config = %config.name,
-                "config has no [Peer] PublicKey and no addresses – skipping"
+                "config has no client addresses – skipping config mapping"
             );
         }
     }
 
     info!(
         total_configs = configs.len(),
-        mapped_by_key = mapped,
         mapped_by_ip = mapped_by_ip,
         "config mapping applied"
     );
@@ -893,6 +1075,7 @@ async fn apply_config_mappings(
 pub async fn rescan_configs(
     db: &crate::db::Database,
     config_dir: &std::path::Path,
+    interface: &InterfaceSelector,
 ) -> anyhow::Result<()> {
     let _guard = acquire_config_mapping_lock().await;
     let dir = config_dir.to_path_buf();
@@ -920,7 +1103,8 @@ pub async fn rescan_configs(
         }
     };
 
-    apply_config_mappings(db, &configs).await?;
+    let scope = interface.config_scope().await?;
+    apply_config_mappings(db, &configs, scope.as_ref()).await?;
     info!("on-demand config rescan complete");
     Ok(())
 }
@@ -929,6 +1113,292 @@ pub async fn rescan_configs(
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    fn config_scope_selector(monitored: &str) -> InterfaceSelector {
+        InterfaceSelector::from_override(Some(monitored))
+            .unwrap()
+            .with_params_reader(|| {
+                Ok(crate::managed_interface::test_params("awg0")
+                    .replace("SERVER_PUB_KEY='PUB'", "SERVER_PUB_KEY='AWG0_SERVER='"))
+            })
+    }
+
+    fn overlapping_interfaces() -> Vec<awg::AwgInterface> {
+        awg::parse_dump(
+            "awg0\tP0\tAWG0_SERVER=\t51820\toff\n\
+             awg0\tALICE_KEY=\t(none)\t(none)\t10.66.66.2/32\t0\t0\t0\toff\n\
+             awg1\tP1\tAWG1_SERVER=\t51821\toff\n\
+             awg1\tBOB_KEY=\t(none)\t(none)\t10.66.66.2/32\t0\t0\t0\toff\n",
+        )
+        .unwrap()
+    }
+
+    fn scoped_client_config(server: &str) -> String {
+        format!(
+            "[Interface]\nPrivateKey = PRIVATE_FIXTURE\nAddress = 10.66.66.2/32\n\
+             [Peer]\nPublicKey = {server}\nEndpoint = 198.51.100.1:51820\nAllowedIPs = 0.0.0.0/0\n"
+        )
+    }
+
+    async fn assert_config_exports(app: &axum::Router, id: i64, expected: axum::http::StatusCode) {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        for export in ["config", "vpn-uri", "qr"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/peers/{id}/{export}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{export}");
+        }
+    }
+
+    #[tokio::test]
+    async fn config_mapping_rejects_other_interfaces_and_repairs_monitoring_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("awg0-client-alice.conf"),
+            scoped_client_config("AWG0_SERVER="),
+        )
+        .unwrap();
+        let db = Database::connect_for_test().await.unwrap();
+        let selector = config_scope_selector("awg1");
+        selector.resolve_mode().unwrap();
+        let poller = Poller::new_full(
+            db.clone(),
+            30,
+            dir.path().into(),
+            dir.path().into(),
+            0,
+            selector,
+        );
+        let scoped = scope_to_interface(overlapping_interfaces(), "awg1").matched;
+        poller.record_poll_batch(&scoped, Utc::now()).await.unwrap();
+        // Metadata left by an older poller must not give Bob Alice's lifecycle
+        // identity. Operator-entered labels and notes remain Bob's own data.
+        sqlx::query("UPDATE peers SET managed_client_name = 'alice', display_name = 'Bob', comment = 'keep note'")
+            .execute(&db.pool).await.unwrap();
+        poller.apply_config_mapping_step().await.unwrap();
+        let bob = crate::db::peers::find_by_public_key(&db.pool, "BOB_KEY=")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            bob.has_config, 0,
+            "same IP does not prove interface ownership"
+        );
+        assert_eq!(bob.config_path, None);
+        assert_eq!(bob.managed_client_name, None);
+        assert_eq!(bob.display_name.as_deref(), Some("Bob"));
+        assert_eq!(bob.comment.as_deref(), Some("keep note"));
+    }
+
+    #[tokio::test]
+    async fn config_exports_reject_stale_mapping_before_first_monitoring_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("awg0-client-alice.conf");
+        std::fs::write(&path, scoped_client_config("AWG0_SERVER=")).unwrap();
+        let db = Database::connect_for_test().await.unwrap();
+        sqlx::query(
+            "INSERT INTO peers (public_key, allowed_ips) VALUES ('BOB_KEY=', '10.66.66.2/32')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "BOB_KEY=",
+            "awg0-client-alice",
+            path.to_str().unwrap(),
+            "alice",
+            Some("alice"),
+        )
+        .await
+        .unwrap();
+        let bob = crate::db::peers::find_by_public_key(&db.pool, "BOB_KEY=")
+            .await
+            .unwrap()
+            .unwrap();
+        let app = crate::web::router_with_lifecycle_lock_dir(
+            db,
+            crate::auth::AuthConfig::disabled(),
+            dir.path().into(),
+            dir.path().into(),
+            dir.path().join("missing-sessions.json"),
+            config_scope_selector("awg1"),
+        );
+        assert_config_exports(&app, bob.id, axum::http::StatusCode::NOT_FOUND).await;
+    }
+
+    #[tokio::test]
+    async fn config_exports_invalidate_observed_key_when_installer_scope_changes() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let changed = Arc::new(AtomicBool::new(false));
+        let reader_changed = changed.clone();
+        let selector = InterfaceSelector::from_params().with_params_reader(move || {
+            let (name, key) = if reader_changed.load(Ordering::SeqCst) {
+                ("awg1", "AWG1_SERVER=")
+            } else {
+                ("awg0", "AWG0_SERVER=")
+            };
+            Ok(crate::managed_interface::test_params(name)
+                .replace("SERVER_PUB_KEY='PUB'", &format!("SERVER_PUB_KEY='{key}'")))
+        });
+        selector.resolve_mode().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("awg0-client-alice.conf"),
+            scoped_client_config("AWG0_SERVER="),
+        )
+        .unwrap();
+        let db = Database::connect_for_test().await.unwrap();
+        let poller = Poller::new_full(
+            db.clone(),
+            30,
+            dir.path().into(),
+            dir.path().into(),
+            0,
+            selector.clone(),
+        );
+        poller
+            .record_poll_batch(
+                &scope_to_interface(overlapping_interfaces(), "awg0").matched,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        poller.apply_config_mapping_step().await.unwrap();
+        let alice = crate::db::peers::find_by_public_key(&db.pool, "ALICE_KEY=")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(alice.managed_client_name.as_deref(), Some("alice"));
+        // Use a generic filename to ensure the key cache itself is invalidated,
+        // independently of the installer filename ownership check.
+        std::fs::rename(
+            dir.path().join("awg0-client-alice.conf"),
+            dir.path().join("custom.conf"),
+        )
+        .unwrap();
+        poller.apply_config_mapping_step().await.unwrap();
+        let app = crate::web::router_with_lifecycle_lock_dir(
+            db,
+            crate::auth::AuthConfig::disabled(),
+            dir.path().into(),
+            dir.path().into(),
+            dir.path().join("missing-sessions.json"),
+            selector.clone(),
+        );
+        assert_config_exports(&app, alice.id, axum::http::StatusCode::OK).await;
+        changed.store(true, Ordering::SeqCst);
+        selector.resolve_mode().unwrap();
+        assert_config_exports(&app, alice.id, axum::http::StatusCode::NOT_FOUND).await;
+    }
+
+    #[tokio::test]
+    async fn config_mapping_preserves_owned_exports_and_rejects_conflicting_filenames() {
+        for monitored in ["awg0", "awg1"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Database::connect_for_test().await.unwrap();
+            let selector = config_scope_selector(monitored);
+            selector.resolve_mode().unwrap();
+            let poller = Poller::new_full(
+                db.clone(),
+                30,
+                dir.path().into(),
+                dir.path().into(),
+                0,
+                selector.clone(),
+            );
+            let scoped = scope_to_interface(overlapping_interfaces(), monitored).matched;
+            poller.record_poll_batch(&scoped, Utc::now()).await.unwrap();
+            if monitored == "awg1" {
+                sqlx::query("INSERT INTO peers (public_key, allowed_ips, disabled, managed_client_name) VALUES ('OLD_ALICE=', '10.66.66.2/32', 1, 'historical-alice')")
+                    .execute(&db.pool).await.unwrap();
+            }
+            let (key, server, foreign_name) = if monitored == "awg0" {
+                ("ALICE_KEY=", "AWG0_SERVER=", "awg1-client-wrong")
+            } else {
+                ("BOB_KEY=", "AWG1_SERVER=", "awg0-client-wrong")
+            };
+            let path = dir.path().join(format!("{foreign_name}.conf"));
+            std::fs::write(&path, scoped_client_config(server)).unwrap();
+            poller.apply_config_mapping_step().await.unwrap();
+            let row = crate::db::peers::find_by_public_key(&db.pool, key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                row.has_config, 0,
+                "a foreign filename must not override server ownership"
+            );
+
+            std::fs::rename(&path, dir.path().join("custom-client.conf")).unwrap();
+            poller.apply_config_mapping_step().await.unwrap();
+            let row = crate::db::peers::find_by_public_key(&db.pool, key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.has_config, 1);
+            let app = crate::web::router_with_lifecycle_lock_dir(
+                db,
+                crate::auth::AuthConfig::disabled(),
+                dir.path().into(),
+                dir.path().into(),
+                dir.path().join("missing-sessions.json"),
+                selector,
+            );
+            assert_config_exports(&app, row.id, axum::http::StatusCode::OK).await;
+            // A stale DB link must not authorize replacement file contents.
+            std::fs::write(
+                dir.path().join("custom-client.conf"),
+                scoped_client_config("FOREIGN_SERVER="),
+            )
+            .unwrap();
+            assert_config_exports(&app, row.id, axum::http::StatusCode::NOT_FOUND).await;
+            std::fs::write(
+                dir.path().join("custom-client.conf"),
+                scoped_client_config(server),
+            )
+            .unwrap();
+            poller.record_poll_batch(&[], Utc::now()).await.unwrap();
+            assert_config_exports(
+                &app,
+                row.id,
+                if monitored == "awg0" {
+                    axum::http::StatusCode::OK
+                } else {
+                    axum::http::StatusCode::NOT_FOUND
+                },
+            )
+            .await;
+            poller.apply_config_mapping_step().await.unwrap();
+            let row = crate::db::peers::find_by_public_key(&poller.db.pool, key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.has_config, i64::from(monitored == "awg0"));
+            if monitored == "awg1" {
+                let historical =
+                    crate::db::peers::find_by_public_key(&poller.db.pool, "OLD_ALICE=")
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(
+                    historical.managed_client_name.as_deref(),
+                    Some("historical-alice")
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn collect_awg_dump_propagates_success() {
@@ -1343,6 +1813,261 @@ mod tests {
         assert_eq!(remaining_after.len(), 1);
 
         handle.abort();
+    }
+
+    /// A host with the installer's `awg0` and a hand-made `awg1`.
+    const TWO_INTERFACE_DUMP: &str = "\
+awg0\tPRIVATE0\tSERVER0_PUB=\t51820\toff\n\
+awg0\tMANAGED_PEER_A=\t(none)\t203.0.113.10:4000\t10.8.0.2/32\t1700000000\t10\t20\toff\n\
+awg0\tMANAGED_PEER_B=\t(none)\t(none)\t10.8.0.3/32\t0\t0\t0\toff\n\
+awg1\tPRIVATE1\tSERVER1_PUB=\t51821\toff\n\
+awg1\tFOREIGN_PEER=\t(none)\t203.0.113.11:4001\t10.9.0.2/32\t1700000000\t30\t40\toff\n\
+";
+
+    async fn peer_exists(db: &Database, public_key: &str) -> bool {
+        crate::db::peers::find_by_public_key(&db.pool, public_key)
+            .await
+            .expect("find peer")
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn scoped_poll_batch_records_only_managed_interface_peers() {
+        let db = Database::connect_for_test().await.expect("test database");
+        let dump = awg::parse_dump(TWO_INTERFACE_DUMP).expect("parse dump");
+        let scoped = scope_to_interface(dump, "awg0");
+        assert_eq!(scoped.ignored, vec!["awg1".to_string()]);
+
+        let poller = Poller::new(db.clone(), 30, PathBuf::from("."));
+        let written = poller
+            .record_poll_batch(&scoped.matched, Utc::now())
+            .await
+            .expect("record scoped batch");
+        assert_eq!(written, 2);
+
+        assert!(peer_exists(&db, "MANAGED_PEER_A=").await);
+        assert!(peer_exists(&db, "MANAGED_PEER_B=").await);
+        assert!(!peer_exists(&db, "FOREIGN_PEER=").await);
+
+        let foreign_snapshots: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM snapshots WHERE public_key = ?")
+                .bind("FOREIGN_PEER=")
+                .fetch_one(&db.pool)
+                .await
+                .expect("count snapshots");
+        assert_eq!(foreign_snapshots, 0);
+    }
+
+    #[tokio::test]
+    async fn scoped_stale_cleanup_removes_peers_recorded_from_other_interfaces() {
+        let db = Database::connect_for_test().await.expect("test database");
+        let dump = awg::parse_dump(TWO_INTERFACE_DUMP).expect("parse dump");
+        let poller = Poller::new(db.clone(), 30, PathBuf::from("."));
+
+        // An earlier, unscoped poll recorded the foreign interface's peer.
+        poller
+            .record_poll_batch(&dump, Utc::now())
+            .await
+            .expect("record unscoped batch");
+        assert!(peer_exists(&db, "FOREIGN_PEER=").await);
+
+        let scoped = scope_to_interface(dump, "awg0");
+        poller
+            .remove_stale_peers(&scoped.matched)
+            .await
+            .expect("scoped stale cleanup");
+
+        assert!(!peer_exists(&db, "FOREIGN_PEER=").await);
+        assert!(peer_exists(&db, "MANAGED_PEER_A=").await);
+        assert!(peer_exists(&db, "MANAGED_PEER_B=").await);
+    }
+
+    #[tokio::test]
+    async fn scoped_stale_cleanup_is_skipped_while_managed_interface_is_down() {
+        let db = Database::connect_for_test().await.expect("test database");
+        let dump = awg::parse_dump(TWO_INTERFACE_DUMP).expect("parse dump");
+        let poller = Poller::new(db.clone(), 30, PathBuf::from("."));
+        poller
+            .record_poll_batch(&scope_to_interface(dump, "awg0").matched, Utc::now())
+            .await
+            .expect("record scoped batch");
+
+        // Only the foreign interface is up: the dump carries no managed peers,
+        // which must not be mistaken for "every managed peer was removed".
+        let only_foreign = awg::parse_dump(
+            "awg1\tPRIVATE1\tSERVER1_PUB=\t51821\toff\n\
+             awg1\tFOREIGN_PEER=\t(none)\t(none)\t10.9.0.2/32\t0\t0\t0\toff\n",
+        )
+        .expect("parse dump");
+        let scoped = scope_to_interface(only_foreign, "awg0");
+        assert!(scoped.matched.is_empty());
+        poller
+            .remove_stale_peers(&scoped.matched)
+            .await
+            .expect("cleanup skipped");
+
+        assert!(peer_exists(&db, "MANAGED_PEER_A=").await);
+        assert!(peer_exists(&db, "MANAGED_PEER_B=").await);
+    }
+
+    #[tokio::test]
+    async fn override_without_readable_params_still_names_the_followed_interface() {
+        let selector = InterfaceSelector::from_override(Some("awg1"))
+            .expect("valid override")
+            .with_params_reader(|| {
+                Err(awg::AwgError::NonZeroExit {
+                    status: 1,
+                    stderr: "sudo: a password is required".into(),
+                })
+            });
+        let mode = selector
+            .resolve_mode_off_thread()
+            .await
+            .expect("override needs no params");
+        assert_eq!(mode.interface(), "awg1");
+        assert!(!mode.is_managing());
+    }
+
+    async fn seed_expired_managed_peer(db: &Database) -> i64 {
+        sqlx::query(
+            "INSERT INTO peers (public_key, allowed_ips, managed_client_name, expires_at) \
+             VALUES ('EXPIRED_SCOPE_KEY=', '10.66.66.9/32', 'expired-user', '2000-01-01T00:00:00Z')",
+        )
+        .execute(&db.pool)
+        .await
+        .expect("seed expired peer")
+        .last_insert_rowid()
+    }
+
+    async fn removal_pending(db: &Database, id: i64) -> i64 {
+        sqlx::query_scalar("SELECT removal_pending FROM peers WHERE id = ?")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("removal_pending")
+    }
+
+    #[tokio::test]
+    async fn expired_user_cleanup_only_runs_in_management_mode() {
+        let db = Database::connect_for_test().await.expect("test database");
+        let id = seed_expired_managed_peer(&db).await;
+        let state_dir = tempfile::tempdir().expect("state tempdir");
+        let poller = Poller::new_full(
+            db.clone(),
+            30,
+            state_dir.path().join("missing-clients"),
+            state_dir.path().to_path_buf(),
+            0,
+            InterfaceSelector::from_override(Some("awg1")).expect("valid override"),
+        );
+
+        // Monitoring-only: the installer's interface must not be reconciled,
+        // so the expired peer is left untouched and no removal is started.
+        poller
+            .cleanup_expired_users_step(&PanelMode::MonitoringOnly {
+                monitored: "awg1".into(),
+                installer: Some("awg0".into()),
+            })
+            .await;
+        assert_eq!(removal_pending(&db, id).await, 0);
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE action IN (?, ?)")
+                .bind(crate::db::events::EVT_USER_REMOVE_REQUESTED)
+                .bind(crate::db::events::EVT_USER_REMOVE_FAILED)
+                .fetch_one(&db.pool)
+                .await
+                .expect("count removal events");
+        assert_eq!(attempts, 0);
+
+        // Management mode starts the native removal (which cannot complete in
+        // the test environment) and therefore marks the retry state.
+        poller
+            .cleanup_expired_users_step(&PanelMode::Managing {
+                interface: "awg0".into(),
+            })
+            .await;
+        assert_eq!(removal_pending(&db, id).await, 1);
+    }
+
+    #[test]
+    fn scope_log_reports_mode_changes_once() {
+        let mut log = ScopeLog::default();
+        let managing = PanelMode::Managing {
+            interface: "awg0".into(),
+        };
+        let monitoring = PanelMode::MonitoringOnly {
+            monitored: "awg1".into(),
+            installer: Some("awg0".into()),
+        };
+
+        assert_eq!(log.observe_mode(&managing), Some(None));
+        assert_eq!(log.observe_mode(&managing), None);
+        assert_eq!(log.observe_mode(&monitoring), Some(Some(managing.clone())));
+        assert_eq!(log.observe_mode(&monitoring), None);
+        assert_eq!(log.observe_mode(&managing), Some(Some(monitoring)));
+    }
+
+    #[test]
+    fn scope_log_reports_each_change_once() {
+        let mut log = ScopeLog::default();
+        let foreign = vec!["awg1".to_string()];
+
+        let first = log.observe("awg0", true, &foreign);
+        assert_eq!(
+            first,
+            ScopeChanges {
+                interface: true,
+                presence: false,
+                ignored: true,
+            }
+        );
+
+        let steady = log.observe("awg0", true, &foreign);
+        assert_eq!(steady, ScopeChanges::default());
+
+        let down = log.observe("awg0", false, &foreign);
+        assert_eq!(
+            down,
+            ScopeChanges {
+                interface: false,
+                presence: true,
+                ignored: false,
+            }
+        );
+
+        let alone = log.observe("awg0", true, &[]);
+        assert_eq!(
+            alone,
+            ScopeChanges {
+                interface: false,
+                presence: true,
+                ignored: true,
+            }
+        );
+
+        let switched = log.observe("awg1", true, &[]);
+        assert_eq!(
+            switched,
+            ScopeChanges {
+                interface: true,
+                presence: false,
+                ignored: false,
+            }
+        );
+    }
+
+    #[test]
+    fn scope_log_first_observation_warns_only_when_managed_interface_is_missing() {
+        let mut log = ScopeLog::default();
+        let first = log.observe("awg0", false, &[]);
+        assert_eq!(
+            first,
+            ScopeChanges {
+                interface: true,
+                presence: true,
+                ignored: false,
+            }
+        );
     }
 
     #[tokio::test]

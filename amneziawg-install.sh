@@ -3034,6 +3034,99 @@ function removeFromWebPanelDir() {
 	fi
 }
 
+# AmneziaWG prepends S4 junk bytes to every transport packet (S1-S3 pad the
+# small handshake and cookie packets). awg-quick's automatic MTU, the uplink
+# MTU minus 80 bytes of IPv6, UDP and WireGuard overhead, does not allow for
+# them, so full-size transport packets exceed the path MTU and fragment. The
+# recommended MTU takes S4 off as well and never goes below 1280, the IPv6
+# minimum. Client configs assume a 1500-byte path, 1420 minus S4; the server
+# interface starts from the MTU of its uplink instead.
+AWG_DEFAULT_PATH_MTU=1500
+AWG_QUICK_MTU_OVERHEAD=80
+AWG_MIN_MTU=1280
+# The largest S4 that awg-quick's automatic MTU, 1420 on a 1500-byte path,
+# tolerates without fragmenting full-size transport packets: behind an IPv4
+# endpoint the outer overhead is 60 bytes, which leaves 20; behind an IPv6
+# endpoint it is 80, which leaves nothing.
+AWG_S4_AUTOMATIC_MTU_LIMIT_IPV4=20
+AWG_S4_AUTOMATIC_MTU_LIMIT_IPV6=0
+# The largest S4 a fresh install draws or accepts: 150, the protocol range,
+# behind an IPv4 endpoint; 140 behind one that may be IPv6, where even the
+# 1280 minimum MTU plus 80 bytes of overhead and S4 must fit a 1500-byte path.
+AWG_S4_MAX=150
+AWG_S4_MAX_IPV6=140
+
+function recommendedMtuForS4() { # <S4> [path MTU, default 1500]
+	local S4="${1:-}" PATH_MTU="${2:-${AWG_DEFAULT_PATH_MTU}}" MTU
+	if ! [[ "${S4}" =~ ^[0-9]+$ ]]; then
+		echo "ERROR: recommendedMtuForS4 needs a decimal S4, got '${S4}'." >&2
+		return 1
+	fi
+	if ! [[ "${PATH_MTU}" =~ ^[0-9]+$ ]]; then
+		echo "ERROR: recommendedMtuForS4 needs a decimal path MTU, got '${PATH_MTU}'." >&2
+		return 1
+	fi
+	MTU=$((10#${PATH_MTU} - AWG_QUICK_MTU_OVERHEAD - 10#${S4}))
+	(( MTU >= AWG_MIN_MTU )) || MTU=${AWG_MIN_MTU}
+	printf '%s' "${MTU}"
+}
+
+# Preserve explicit default-route MTUs before falling back to the NIC MTU.
+# A server can serve peers over either family, so use the smallest route MTU
+# on its uplink across IPv4 and IPv6. Fall back to sysfs, then 1500.
+function uplinkMtu() { # <nic>
+	local NIC="${1:-}" MTU="" FAMILY ROUTE ROUTE_MTU
+	if [[ -n "${NIC}" && "${NIC}" != */* ]]; then
+		for FAMILY in -4 -6; do
+			while IFS= read -r ROUTE; do
+				if [[ "${ROUTE}" =~ (^|[[:space:]])mtu[[:space:]]+(lock[[:space:]]+)?([0-9]{1,5})($|[[:space:]]) ]]; then
+					ROUTE_MTU=$((10#${BASH_REMATCH[3]}))
+					if (( ROUTE_MTU > 0 )) && { [[ -z "${MTU}" ]] || (( ROUTE_MTU < MTU )); }; then
+						MTU="${ROUTE_MTU}"
+					fi
+				fi
+			done < <(ip "${FAMILY}" route show default dev "${NIC}" 2>/dev/null || true)
+		done
+		if [[ -n "${MTU}" ]]; then
+			printf '%s' "${MTU}"
+			return
+		fi
+		if [[ -r "/sys/class/net/${NIC}/mtu" ]]; then
+			read -r MTU <"/sys/class/net/${NIC}/mtu" || true
+		fi
+	fi
+	if [[ "${MTU}" =~ ^[0-9]+$ ]] && (( MTU >= AWG_MIN_MTU )); then
+		printf '%s' "${MTU}"
+	else
+		printf '%s' "${AWG_DEFAULT_PATH_MTU}"
+	fi
+}
+
+# Whether the endpoint clients connect to is an IPv4 literal. Anything else,
+# an IPv6 literal or a hostname that may resolve to IPv6, gets the larger
+# IPv6 overhead in the S4 limits below.
+function endpointIsIPv4() { # <SERVER_PUB_IP>
+	[[ "${1:-}" =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]
+}
+
+# The largest S4 that an automatic client MTU tolerates behind the endpoint.
+function s4LimitForAutomaticMtu() { # <SERVER_PUB_IP>
+	if endpointIsIPv4 "${1:-}"; then
+		printf '%s' "${AWG_S4_AUTOMATIC_MTU_LIMIT_IPV4}"
+	else
+		printf '%s' "${AWG_S4_AUTOMATIC_MTU_LIMIT_IPV6}"
+	fi
+}
+
+# The largest S4 a fresh install draws or accepts behind the endpoint.
+function s4MaxForEndpoint() { # <SERVER_PUB_IP>
+	if endpointIsIPv4 "${1:-}"; then
+		printf '%s' "${AWG_S4_MAX}"
+	else
+		printf '%s' "${AWG_S4_MAX_IPV6}"
+	fi
+}
+
 # Optional client MTU: use an IPv6-compatible minimum for both address families.
 # Reject noncanonical numbers before arithmetic or writing configuration lines.
 function validateClientMtu() {
@@ -8053,20 +8146,31 @@ function readS1AndS2() {
 	done
 }
 
+# S4 pads every transport packet, so behind an endpoint that may be IPv6 it
+# stays at or below 140 (s4MaxForEndpoint); S3 pads only cookie replies.
 function generateS3AndS4() {
 	RANDOM_AWG_S3=$(shuf -i15-150 -n1)
-	RANDOM_AWG_S4=$(shuf -i15-150 -n1)
+	RANDOM_AWG_S4=$(shuf -i15-"$(s4MaxForEndpoint "${SERVER_PUB_IP:-}")" -n1)
 }
 
 function readS3AndS4() {
+	local S4_MAX
+	S4_MAX="$(s4MaxForEndpoint "${SERVER_PUB_IP:-}")"
 	SERVER_AWG_S3=0
 	SERVER_AWG_S4=0
-	until [[ ${SERVER_AWG_S3} =~ ^[0-9]+$ ]] && (( ${SERVER_AWG_S3} >= 15 )) && (( ${SERVER_AWG_S3} <= 150 )); do
+	# Bound the significant digits before arithmetic so oversized input cannot
+	# wrap into range; 10# keeps leading zeros decimal, as upstream parses them.
+	until [[ ${SERVER_AWG_S3} =~ ^0*[0-9]{1,3}$ ]] && (( 10#${SERVER_AWG_S3} >= 15 )) && (( 10#${SERVER_AWG_S3} <= 150 )); do
 		read -rp "Server AmneziaWG S3 [15-150]: " -e -i "${RANDOM_AWG_S3}" SERVER_AWG_S3
 	done
-	until [[ ${SERVER_AWG_S4} =~ ^[0-9]+$ ]] && (( ${SERVER_AWG_S4} >= 15 )) && (( ${SERVER_AWG_S4} <= 150 )); do
-		read -rp "Server AmneziaWG S4 [15-150]: " -e -i "${RANDOM_AWG_S4}" SERVER_AWG_S4
+	until [[ ${SERVER_AWG_S4} =~ ^0*[0-9]{1,3}$ ]] && (( 10#${SERVER_AWG_S4} >= 15 )) && (( 10#${SERVER_AWG_S4} <= S4_MAX )); do
+		read -rp "Server AmneziaWG S4 [15-${S4_MAX}]: " -e -i "${RANDOM_AWG_S4}" SERVER_AWG_S4
+		if [[ ${SERVER_AWG_S4} =~ ^0*[0-9]{1,3}$ ]] && (( 10#${SERVER_AWG_S4} > S4_MAX && 10#${SERVER_AWG_S4} <= AWG_S4_MAX )); then
+			echo "S4 stays at or below ${S4_MAX} behind an IPv6 endpoint or a hostname: even at the 1280 minimum MTU, a larger S4 pushes full-size transport packets past 1500 bytes on the wire."
+		fi
 	done
+	SERVER_AWG_S3=$((10#${SERVER_AWG_S3}))
+	SERVER_AWG_S4=$((10#${SERVER_AWG_S4}))
 }
 
 # Parse a range string "min-max" or single value into MIN and MAX variables
@@ -8502,6 +8606,30 @@ function askBoringtunImitation() {
 	AWG_BORINGTUN_IMITATE_DOMAIN="${DOMAIN}"
 }
 
+# Ask for the client MTU once S4 is known. The S4-aware recommendation for a
+# 1500-byte path is the default, unless the caller exported a CLIENT_MTU,
+# which is kept as the default instead. An empty answer leaves client configs
+# without an MTU line, so awg-quick picks its automatic MTU; that fragments
+# full-size transport packets once S4 exceeds what the endpoint's overhead
+# leaves (s4LimitForAutomaticMtu), which the prompt then says.
+function askClientMtu() {
+	local RECOMMENDED_MTU S4_LIMIT
+	RECOMMENDED_MTU="$(recommendedMtuForS4 "${SERVER_AWG_S4}")" || exit 1
+	S4_LIMIT="$(s4LimitForAutomaticMtu "${SERVER_PUB_IP:-}")"
+	echo ""
+	echo -e "${GREEN}Client MTU:${NC}"
+	echo "AmneziaWG prepends S4 = ${SERVER_AWG_S4} junk bytes to every transport packet, which awg-quick's automatic MTU does not allow for."
+	echo "The recommended client MTU for S4 = ${SERVER_AWG_S4} on a 1500-byte path is ${RECOMMENDED_MTU}; the server interface gets the same, derived from the MTU of its uplink."
+	while true; do
+		IFS= read -rp "Client MTU (1280-65535, empty for automatic): " -e -i "${CLIENT_MTU:-${RECOMMENDED_MTU}}" CLIENT_MTU || exit 1
+		validateClientMtu && break
+	done
+	if [[ -z "${CLIENT_MTU}" ]] && (( 10#${SERVER_AWG_S4} > S4_LIMIT )); then
+		echo -e "${ORANGE}WARNING: with S4 = ${SERVER_AWG_S4} and an automatic MTU, full-size transport packets exceed 1500 bytes on the wire and fragment: the automatic MTU tolerates S4 up to ${AWG_S4_AUTOMATIC_MTU_LIMIT_IPV4} behind an IPv4 endpoint and none behind an IPv6 endpoint or a hostname.${NC}"
+		echo -e "${ORANGE}         Set MTU = ${RECOMMENDED_MTU} in the client configs if connections stall.${NC}"
+	fi
+}
+
 function installQuestions() {
 	validateClientMtu || exit 1
 	# Fresh installs remain on AWG 2.0 regardless of caller environment. AWG 3.0
@@ -8641,6 +8769,14 @@ function installQuestions() {
 		SERVER_AWG_S3=${RANDOM_AWG_S3}
 		SERVER_AWG_S4=${RANDOM_AWG_S4}
 
+		# The client MTU defaults to the S4-aware recommendation for a 1500-byte
+		# path. A CLIENT_MTU the operator exported is kept, even an empty one,
+		# which leaves the MTU line out of client configs for awg-quick's
+		# automatic MTU.
+		if [[ -z "${CLIENT_MTU+set}" ]]; then
+			CLIENT_MTU="$(recommendedMtuForS4 "${SERVER_AWG_S4}")" || exit 1
+		fi
+
 		generateH1AndH2AndH3AndH4Ranges
 		SERVER_AWG_H1="${RANDOM_AWG_H1_MIN}-${RANDOM_AWG_H1_MAX}"
 		SERVER_AWG_H2="${RANDOM_AWG_H2_MIN}-${RANDOM_AWG_H2_MAX}"
@@ -8744,11 +8880,6 @@ function installQuestions() {
 		echo -e "${ORANGE}Invalid IPv4 address. Enter a valid address or leave empty to skip.${NC}"
 	done
 
-	while true; do
-		IFS= read -rp "Client MTU (1280-65535, empty for automatic): " -e -i "${CLIENT_MTU:-}" CLIENT_MTU || exit 1
-		validateClientMtu && break
-	done
-
 	if [[ "${ENABLE_IPV6}" == "y" ]]; then ALLOWED_IPS_DEFAULT='0.0.0.0/0, ::/0'; else ALLOWED_IPS_DEFAULT='0.0.0.0/0'; fi
 	while true; do
 		echo -e "\nAmneziaWG uses a parameter called AllowedIPs to determine what is routed over the VPN."
@@ -8803,6 +8934,9 @@ function installQuestions() {
 		echo "AmneziaWG requires S3 + 56 != S4 and S4 + 56 != S3"
 		readS3AndS4
 	done
+
+	# Client MTU, asked once S4 is known because the recommended value depends on it
+	askClientMtu
 
 	# H1-H4 Ranged Headers (AmneziaWG 2.0)
 	echo -e "\n${GREEN}H1-H4 Ranged Headers (ranges must not overlap):${NC}"
@@ -9164,6 +9298,39 @@ function configureDebianAmneziaAptSource() {
 	fi
 }
 
+# Print the [Interface] section of a fresh server configuration: the
+# addresses (IPv6 only when enabled), the S4-aware MTU derived from the
+# uplink's MTU, port, key and the obfuscation parameters. writeFirewallRules
+# appends the hooks. Nothing is printed when a field cannot be rendered.
+function renderAwgServerInterface() {
+	local SERVER_ADDRESS="${SERVER_AWG_IPV4}/24"
+	if [[ "${ENABLE_IPV6}" == "y" ]]; then
+		SERVER_ADDRESS="${SERVER_ADDRESS},${SERVER_AWG_IPV6}/64"
+	fi
+	# awg-quick honours MTU; its automatic value, the uplink MTU minus 80,
+	# ignores the S4 junk bytes, so start from the same uplink and take them off.
+	local SERVER_MTU AWG_PROTOCOL_FIELDS
+	SERVER_MTU="$(recommendedMtuForS4 "${SERVER_AWG_S4}" "$(uplinkMtu "${SERVER_PUB_NIC:-}")")" || return 1
+	AWG_PROTOCOL_FIELDS="$(renderAwgProtocolFields)" || return 1
+	echo "[Interface]
+Address = ${SERVER_ADDRESS}
+MTU = ${SERVER_MTU}
+ListenPort = ${SERVER_PORT}
+PrivateKey = ${SERVER_PRIV_KEY}
+Jc = ${SERVER_AWG_JC}
+Jmin = ${SERVER_AWG_JMIN}
+Jmax = ${SERVER_AWG_JMAX}
+S1 = ${SERVER_AWG_S1}
+S2 = ${SERVER_AWG_S2}
+S3 = ${SERVER_AWG_S3}
+S4 = ${SERVER_AWG_S4}
+H1 = ${SERVER_AWG_H1}
+H2 = ${SERVER_AWG_H2}
+H3 = ${SERVER_AWG_H3}
+H4 = ${SERVER_AWG_H4}
+${AWG_PROTOCOL_FIELDS}"
+}
+
 # Write the state of a fresh installation, which both backends share: server
 # keys, params, the server configuration with its firewall hooks, and the
 # forwarding sysctls.
@@ -9192,32 +9359,13 @@ function writeAwgServerInstallState() {
 	fi
 	chmod 600 "${AMNEZIAWG_DIR}/params"
 
-	# Add server interface. Include the IPv6 address only when IPv6 is enabled.
-	local SERVER_ADDRESS="${SERVER_AWG_IPV4}/24"
-	if [[ "${ENABLE_IPV6}" == "y" ]]; then
-		SERVER_ADDRESS="${SERVER_ADDRESS},${SERVER_AWG_IPV6}/64"
-	fi
-	local AWG_PROTOCOL_FIELDS=""
-	AWG_PROTOCOL_FIELDS="$(renderAwgProtocolFields)" || {
-		echo -e "${RED}ERROR: Failed to render protocol-specific server configuration.${NC}"
+	# Add server interface. The renderer prints nothing when it fails, so the
+	# empty file a failure leaves behind goes with it.
+	if ! renderAwgServerInterface >"${SERVER_AWG_CONF}"; then
+		rm -f "${SERVER_AWG_CONF}"
+		echo -e "${RED}ERROR: Failed to render the server configuration.${NC}"
 		exit 1
-	}
-	echo "[Interface]
-Address = ${SERVER_ADDRESS}
-ListenPort = ${SERVER_PORT}
-PrivateKey = ${SERVER_PRIV_KEY}
-Jc = ${SERVER_AWG_JC}
-Jmin = ${SERVER_AWG_JMIN}
-Jmax = ${SERVER_AWG_JMAX}
-S1 = ${SERVER_AWG_S1}
-S2 = ${SERVER_AWG_S2}
-S3 = ${SERVER_AWG_S3}
-S4 = ${SERVER_AWG_S4}
-H1 = ${SERVER_AWG_H1}
-H2 = ${SERVER_AWG_H2}
-H3 = ${SERVER_AWG_H3}
-H4 = ${SERVER_AWG_H4}
-${AWG_PROTOCOL_FIELDS}" >"${SERVER_AWG_CONF}"
+	fi
 	chmod 600 "${SERVER_AWG_CONF}"
 
 	# Restore default umask before creating system files and running services
@@ -10744,10 +10892,10 @@ function migrateS3S4() {
 	# If both S3/S4 are present, validate them before skipping migration.
 	# This catches invalid values from manual edits or partial writes.
 	if [[ -n "${SERVER_AWG_S3}" ]] && [[ -n "${SERVER_AWG_S4}" ]]; then
-		if [[ "${SERVER_AWG_S3}" =~ ^[0-9]+$ ]] && [[ "${SERVER_AWG_S4}" =~ ^[0-9]+$ ]] && \
-		   (( SERVER_AWG_S3 >= 15 )) && (( SERVER_AWG_S3 <= 150 )) && \
-		   (( SERVER_AWG_S4 >= 15 )) && (( SERVER_AWG_S4 <= 150 )) && \
-		   (( SERVER_AWG_S3 + 56 != SERVER_AWG_S4 )) && (( SERVER_AWG_S4 + 56 != SERVER_AWG_S3 )); then
+		if [[ "${SERVER_AWG_S3}" =~ ^0*[0-9]{1,3}$ ]] && [[ "${SERVER_AWG_S4}" =~ ^0*[0-9]{1,3}$ ]] && \
+		   (( 10#${SERVER_AWG_S3} >= 15 )) && (( 10#${SERVER_AWG_S3} <= 150 )) && \
+		   (( 10#${SERVER_AWG_S4} >= 15 )) && (( 10#${SERVER_AWG_S4} <= 150 )) && \
+		   (( 10#${SERVER_AWG_S3} + 56 != 10#${SERVER_AWG_S4} )) && (( 10#${SERVER_AWG_S4} + 56 != 10#${SERVER_AWG_S3} )); then
 			return 1
 		fi
 		# Values are present but invalid — clear them so the logic below regenerates
@@ -10764,10 +10912,10 @@ function migrateS3S4() {
 	if [[ -n "${CONF_S3}" ]] && [[ -n "${CONF_S4}" ]]; then
 		# Validate that loaded values are numeric, within valid range [15-150],
 		# and satisfy the bidirectional constraint S3 + 56 != S4 and S4 + 56 != S3
-		if [[ "${CONF_S3}" =~ ^[0-9]+$ ]] && [[ "${CONF_S4}" =~ ^[0-9]+$ ]] && \
-		   (( CONF_S3 >= 15 )) && (( CONF_S3 <= 150 )) && \
-		   (( CONF_S4 >= 15 )) && (( CONF_S4 <= 150 )) && \
-		   (( CONF_S3 + 56 != CONF_S4 )) && (( CONF_S4 + 56 != CONF_S3 )); then
+		if [[ "${CONF_S3}" =~ ^0*[0-9]{1,3}$ ]] && [[ "${CONF_S4}" =~ ^0*[0-9]{1,3}$ ]] && \
+		   (( 10#${CONF_S3} >= 15 )) && (( 10#${CONF_S3} <= 150 )) && \
+		   (( 10#${CONF_S4} >= 15 )) && (( 10#${CONF_S4} <= 150 )) && \
+		   (( 10#${CONF_S3} + 56 != 10#${CONF_S4} )) && (( 10#${CONF_S4} + 56 != 10#${CONF_S3} )); then
 			SERVER_AWG_S3="${CONF_S3}"
 			SERVER_AWG_S4="${CONF_S4}"
 		else
@@ -11022,6 +11170,10 @@ function persistMigration() {
 	# Update server configuration file with migrated values
 	echo -e "${GREEN}Updating server configuration file...${NC}"
 
+	# The S4 the running server used until now, to tell a new one apart below.
+	local ORIG_CONF_S4
+	ORIG_CONF_S4="$(grep -E '^S4 = ' "${SERVER_AWG_CONF}" 2>/dev/null | sed 's/^S4 = //')"
+
 	# Insert or update S3 (try update first, then insert after S2)
 	if grep -q "^S3 = " "${SERVER_AWG_CONF}"; then
 		if ! sed -i "s|^S3 = .*|S3 = ${SERVER_AWG_S3}|" "${SERVER_AWG_CONF}"; then
@@ -11182,6 +11334,16 @@ function persistMigration() {
 
 	echo -e "${GREEN}Migration completed successfully.${NC}"
 	echo ""
+	# A new S4 changes the recommended MTU. An existing server's interface MTU
+	# and CLIENT_MTU are never changed here; the note is for the operator.
+	if [[ "${ORIG_CONF_S4}" != "${SERVER_AWG_S4}" ]]; then
+		local RECOMMENDED_MTU
+		if RECOMMENDED_MTU="$(recommendedMtuForS4 "${SERVER_AWG_S4}")"; then
+			echo -e "${ORANGE}NOTE: S4 is now ${SERVER_AWG_S4}. AmneziaWG prepends S4 junk bytes to every transport packet, which awg-quick's automatic MTU does not allow for; the recommended MTU on a 1500-byte path is ${RECOMMENDED_MTU}.${NC}"
+			echo -e "${ORANGE}      The server interface MTU and CLIENT_MTU were left as they are. To apply it, set MTU = ${RECOMMENDED_MTU} in ${SERVER_AWG_CONF} and CLIENT_MTU='${RECOMMENDED_MTU}' in ${AMNEZIAWG_DIR}/params before regenerating the client configs.${NC}"
+			echo ""
+		fi
+	fi
 	if (( CLIENT_CONFIGS_RENAMED > 0 )); then
 		echo -e "${ORANGE}NOTE: ${CLIENT_CONFIGS_RENAMED} old client config(s) were renamed with .old suffix.${NC}"
 		echo -e "${ORANGE}You can delete them after regenerating new configs, or keep them for reference.${NC}"
