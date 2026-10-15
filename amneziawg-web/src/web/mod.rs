@@ -26,8 +26,8 @@ use crate::auth::{
     RATE_LIMIT_MAX_ATTEMPTS, RATE_LIMIT_WINDOW,
 };
 use crate::db::events::{
-    list_events, log_event, EVT_AWG_PROTOCOL_CHANGED, EVT_LOGIN_FAILED, EVT_LOGIN_SUCCESS,
-    EVT_LOGOUT, EVT_PEER_DISABLED, EVT_PEER_UPDATED,
+    list_events, log_event, EVT_AWG_PROTOCOL_CHANGED, EVT_AWG_PROTOCOL_CHANGE_FAILED,
+    EVT_LOGIN_FAILED, EVT_LOGIN_SUCCESS, EVT_LOGOUT, EVT_PEER_DISABLED, EVT_PEER_UPDATED,
 };
 use crate::db::peers::{PeerRow, SnapshotRow};
 use crate::db::Database;
@@ -73,12 +73,33 @@ pub struct AppState {
     system_booted_at: Option<DateTime<Utc>>,
     /// Monotonic uptime baseline captured at startup from `/proc/uptime`.
     system_uptime_baseline: Option<SystemUptimeBaseline>,
+    /// The last failed protocol migration, shown under the failure notice.
+    protocol_failure: std::sync::Arc<tokio::sync::RwLock<Option<ProtocolFailure>>>,
 }
 
 #[derive(Clone)]
 struct CachedSystemVersions {
     value: ComponentVersions,
     fetched_at: std::time::Instant,
+}
+
+/// The most recent failed protocol migration, kept in memory so the page the
+/// confirmed form redirects to can show what the installer reported. Only the
+/// diagnostics the privileged helper relayed are kept: a bounded, sanitized
+/// tail of the installer's stderr with key material withheld.
+#[derive(Debug, Clone)]
+struct ProtocolFailure {
+    operation: &'static str,
+    at: DateTime<Utc>,
+    diagnostics: Vec<String>,
+}
+
+/// Status shown above the controls after a redirect: the fixed notice text
+/// and, after a failed migration, the installer output relayed for it.
+#[derive(Clone, Copy, Default)]
+struct PageNotice<'a> {
+    message: Option<&'a str>,
+    protocol_failure: Option<&'a ProtocolFailure>,
 }
 
 #[derive(Clone)]
@@ -136,6 +157,7 @@ impl AppState {
             system_versions_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             system_booted_at,
             system_uptime_baseline,
+            protocol_failure: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -2408,12 +2430,20 @@ async fn page_peer_list(
                 .as_deref()
                 .and_then(imitation_notice_message)
         });
+    let protocol_failure = if query.protocol_notice.as_deref() == Some(PROTOCOL_NOTICE_FAILED) {
+        state.protocol_failure.read().await.clone()
+    } else {
+        None
+    };
     Ok(Html(render_peer_list(
         &peers,
         &csrf,
         &status,
         &proxy_sessions,
-        notice,
+        PageNotice {
+            message: notice,
+            protocol_failure: protocol_failure.as_ref(),
+        },
         show_archived,
     ))
     .into_response())
@@ -2945,6 +2975,7 @@ async fn post_protocol_change(
     *state.system_versions_cache.write().await = None;
     let notice = match result {
         Ok(Ok(())) => {
+            *state.protocol_failure.write().await = None;
             let (version, notice) = protocol_operation_notice(operation);
             let detail = json!({ "version": version }).to_string();
             log_event(
@@ -2960,14 +2991,47 @@ async fn post_protocol_change(
         }
         Ok(Err(error)) => {
             tracing::error!(error = %error, "AWG protocol migration failed");
+            let diagnostics = match &error {
+                crate::awg::AwgError::NonZeroExit { stderr, .. } => {
+                    crate::awg::installer_diagnostics(stderr)
+                }
+                _ => Vec::new(),
+            };
+            record_protocol_failure(state, operation, diagnostics).await;
             PROTOCOL_NOTICE_FAILED
         }
         Err(error) => {
             tracing::error!(error = %error, "AWG protocol migration task failed");
+            record_protocol_failure(state, operation, Vec::new()).await;
             PROTOCOL_NOTICE_FAILED
         }
     };
     Ok(Redirect::to(&format!("/?protocol_notice={notice}")).into_response())
+}
+
+/// Remember a failed migration for the redirected page and audit it. The
+/// diagnostics are what the privileged helper relayed from the installer's
+/// stderr: bounded, free of terminal escapes, with key material withheld.
+async fn record_protocol_failure(
+    state: &AppState,
+    operation: &'static str,
+    diagnostics: Vec<String>,
+) {
+    let detail = json!({ "operation": operation, "diagnostics": diagnostics }).to_string();
+    log_event(
+        &state.db.pool,
+        EVT_AWG_PROTOCOL_CHANGE_FAILED,
+        None,
+        None,
+        Some(&detail),
+        &state.auth.username,
+    )
+    .await;
+    *state.protocol_failure.write().await = Some(ProtocolFailure {
+        operation,
+        at: Utc::now(),
+        diagnostics,
+    });
 }
 
 async fn post_enable_awg31_form(
@@ -4103,7 +4167,7 @@ fn render_peer_list(
     csrf_token: &str,
     system_status: &SystemStatusDto,
     proxy_sessions: &ProxySessionsDto,
-    notice: Option<&str>,
+    notice: PageNotice<'_>,
     show_archived: bool,
 ) -> String {
     render_peer_list_inner(
@@ -4128,10 +4192,43 @@ fn render_peer_list_with_error(
         csrf_token,
         system_status,
         None,
-        None,
+        PageNotice::default(),
         Some(error),
         false,
     )
+}
+
+/// Installer output relayed by the privileged helper for the last failed
+/// migration. Every line is HTML-escaped here; the helper already stripped
+/// terminal escapes and withheld key material.
+fn render_protocol_failure(failure: &ProtocolFailure) -> String {
+    let operation = match failure.operation {
+        "enable-awg31" => "AWG 3.1 migration",
+        "disable-awg3" => "AWG 2.0 migration",
+        other => other,
+    };
+    let mut buf = format!(
+        "<details class=\"protocol-diagnostics\" open>\n\
+         <summary>Installer output for the failed {} at {} UTC</summary>\n",
+        esc(operation),
+        failure.at.format("%Y-%m-%d %H:%M:%S")
+    );
+    if failure.diagnostics.is_empty() {
+        buf.push_str(
+            "<p class=\"meta\">The installer reported no details. Check the amneziawg-web service journal on the server.</p>\n",
+        );
+    } else {
+        buf.push_str(
+            "<p class=\"meta\">Last lines of the installer's error output; key material is withheld.</p>\n<pre>",
+        );
+        for line in &failure.diagnostics {
+            buf.push_str(&esc(line));
+            buf.push('\n');
+        }
+        buf.push_str("</pre>\n");
+    }
+    buf.push_str("</details>\n");
+    buf
 }
 
 fn render_imitation_controls(csrf_token: &str) -> String {
@@ -4193,7 +4290,7 @@ fn render_peer_list_inner(
     csrf_token: &str,
     system_status: &SystemStatusDto,
     proxy_sessions: Option<&ProxySessionsDto>,
-    notice: Option<&str>,
+    notice: PageNotice<'_>,
     error: Option<&str>,
     show_archived: bool,
 ) -> String {
@@ -4218,11 +4315,14 @@ fn render_peer_list_inner(
          <span class=\"counter-scope\">Traffic period: since boot/interface restart</span></p>\n",
         peers.len()
     ));
-    if let Some(notice) = notice {
+    if let Some(message) = notice.message {
         buf.push_str(&format!(
             "<p class=\"creation-warning\" role=\"status\">{}</p>\n",
-            esc(notice)
+            esc(message)
         ));
+    }
+    if let Some(failure) = notice.protocol_failure {
+        buf.push_str(&render_protocol_failure(failure));
     }
     buf.push_str(&render_protocol_controls(csrf_token));
     buf.push_str(&render_imitation_controls(csrf_token));
@@ -9022,6 +9122,94 @@ mod tests {
                 confirmed
             );
         }
+    }
+
+    #[tokio::test]
+    async fn failed_protocol_attempt_is_remembered_and_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            test_db().await,
+            AuthConfig::disabled(),
+            dir.path().into(),
+            dir.path().into(),
+            missing_proxy_sessions_file(),
+        );
+        assert!(state.protocol_failure.read().await.is_none());
+        // Unsupported operations fail before sudo runs, so the attempt
+        // completes without helper output and without touching the host VPN.
+        let response = post_protocol_change(
+            &state,
+            &HeaderMap::new(),
+            ProtocolChangeForm {
+                csrf_token: None,
+                confirm: Some("yes".into()),
+            },
+            "unsupported-test-operation",
+        )
+        .await
+        .unwrap_or_else(|_| panic!("protocol handler returned an unexpected API error"));
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let failure = state
+            .protocol_failure
+            .read()
+            .await
+            .clone()
+            .expect("failed attempt is remembered");
+        assert_eq!(failure.operation, "unsupported-test-operation");
+        assert!(failure.diagnostics.is_empty());
+        let detail: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT detail FROM events WHERE action = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(EVT_AWG_PROTOCOL_CHANGE_FAILED)
+        .fetch_optional(&state.db.pool)
+        .await
+        .unwrap();
+        let detail = detail
+            .flatten()
+            .expect("failure event carries a detail payload");
+        assert!(
+            detail.contains("\"operation\":\"unsupported-test-operation\""),
+            "{detail}"
+        );
+        assert!(detail.contains("\"diagnostics\":[]"), "{detail}");
+    }
+
+    #[test]
+    fn protocol_failure_diagnostics_render_escaped() {
+        let at = Utc.with_ymd_and_hms(2026, 10, 15, 12, 0, 0).unwrap();
+        let failure = ProtocolFailure {
+            operation: "enable-awg31",
+            at,
+            diagnostics: vec![
+                "awg setconf rejected client 2 (alice)".into(),
+                "<script>alert(1)</script> & co".into(),
+            ],
+        };
+        let html = render_protocol_failure(&failure);
+        assert!(
+            html.contains(
+                "Installer output for the failed AWG 3.1 migration at 2026-10-15 12:00:00 UTC"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains("awg setconf rejected client 2 (alice)"),
+            "{html}"
+        );
+        assert!(
+            html.contains("&lt;script&gt;alert(1)&lt;/script&gt; &amp; co"),
+            "{html}"
+        );
+        assert!(!html.contains("<script>"), "{html}");
+
+        let silent = render_protocol_failure(&ProtocolFailure {
+            operation: "disable-awg3",
+            at,
+            diagnostics: Vec::new(),
+        });
+        assert!(silent.contains("AWG 2.0 migration"), "{silent}");
+        assert!(silent.contains("reported no details"), "{silent}");
+        assert!(!silent.contains("<pre>"), "{silent}");
     }
 
     #[tokio::test]

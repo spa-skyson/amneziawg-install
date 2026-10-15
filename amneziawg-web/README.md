@@ -341,8 +341,14 @@ no shell interpolation.
 
 Protocol migration is also routed through the helper. It resolves only the
 root-owned lifecycle script recorded beside the service's configured
-environment file, accepts only fixed enable/disable operations, and suppresses
-script output. The panel offers AWG 2.0 and AWG 3.1. Existing AWG 3.0
+environment file, accepts only fixed enable/disable operations, and discards the
+script's stdout. When a migration fails, the helper relays a bounded tail of the
+script's stderr after its own failure line, with terminal escapes stripped,
+key-shaped values masked, and lines quoting key assignments withheld; the panel
+shows those lines under the failure notice, records them in the audit log as an
+`awg_protocol_change_failed` event, and writes them to the service journal, so
+the operator can see which staged file or step the installer rejected.
+The panel offers AWG 2.0 and AWG 3.1. Existing AWG 3.0
 installations are recognized as legacy and can switch to either offered mode;
 the panel has no action or helper command to enable AWG 3.0. The installer's
 standalone CLI retains its existing protocol support.
