@@ -28,7 +28,7 @@
 # Intended deployment topology when loopback rebinding succeeds:
 #   VPN clients → 0.0.0.0:LISTEN_PORT (proxy) → 127.0.0.1:BACKEND_PORT (AWG)
 #
-# https://github.com/wiresock/amneziawg-install
+# https://github.com/wiresock/awg-server-tools
 
 set -euo pipefail
 
@@ -312,7 +312,7 @@ check_awg_binary() {
     awg_bin="$(command -v awg 2>/dev/null)"
     if [[ -z "${awg_bin}" || ! -x "${awg_bin}" ]]; then
         die "AWG binary not found in PATH or is not executable.
-Install AmneziaWG first (https://github.com/wiresock/amneziawg-install)."
+Install AmneziaWG first (https://github.com/wiresock/awg-server-tools)."
     fi
     info "AWG binary: ${awg_bin}"
 }
@@ -1796,7 +1796,7 @@ install_service_unit() {
 [Unit]
 Description=AmneziaWG UDP Proxy (DPI obfuscation layer)
 After=network.target
-Documentation=https://github.com/wiresock/amneziawg-install
+Documentation=https://github.com/wiresock/awg-server-tools
 
 [Service]
 Type=simple

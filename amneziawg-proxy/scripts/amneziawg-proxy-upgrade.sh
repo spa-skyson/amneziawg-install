@@ -20,7 +20,7 @@
 #   --refresh-unit     reinstall the systemd unit template from the repository
 #   --install-rust     install Rust toolchain via rustup if missing (source mode)
 #
-# https://github.com/wiresock/amneziawg-install
+# https://github.com/wiresock/awg-server-tools
 
 set -euo pipefail
 

@@ -142,7 +142,7 @@ assert_true "the embedded source commit is a full commit SHA" eval '[[ "${AWG_BT
 assert_true "the embedded build is a positive integer" eval '[[ "${AWG_BT_RELEASE_BUILD}" =~ ^[1-9][0-9]*$ ]]'
 assert_eq "boringtun-cli-${AWG_BT_RELEASE_VERSION}-g${AWG_BT_RELEASE_SOURCE_COMMIT:0:12}-b${AWG_BT_RELEASE_BUILD}" "${AWG_BT_RELEASE_TAG}" \
 	"the embedded tag follows from the embedded version, commit and build"
-assert_eq "https://github.com/wiresock/amneziawg-install/releases/download/${AWG_BT_RELEASE_TAG}" "${AWG_BT_RELEASE_BASE_URL}" \
+assert_eq "https://github.com/wiresock/awg-server-tools/releases/download/${AWG_BT_RELEASE_TAG}" "${AWG_BT_RELEASE_BASE_URL}" \
 	"downloads come from exactly this repository's release of that tag, over HTTPS"
 assert_eq "boringtun-cli-${AWG_BT_RELEASE_VERSION}-g${AWG_BT_RELEASE_SOURCE_COMMIT:0:12}-linux-x86_64-musl.tar.gz" \
 	"${AWG_BT_RELEASE_ASSET_X86_64}" "the x86_64 asset name follows from the version and commit"
@@ -168,13 +168,13 @@ inconsistent_installer "a tag of another build is inconsistent" "AWG_BT_RELEASE_
 inconsistent_installer "a tag of another commit is inconsistent" "AWG_BT_RELEASE_TAG" \
 	TAG "boringtun-cli-${AWG_BT_RELEASE_VERSION}-gfedcba987654-b${AWG_BT_RELEASE_BUILD}"
 inconsistent_installer "a download URL of another tag is inconsistent" "AWG_BT_RELEASE_BASE_URL" \
-	BASE_URL "https://github.com/wiresock/amneziawg-install/releases/download/boringtun-cli-0.0.1-gfedcba987654-b1"
+	BASE_URL "https://github.com/wiresock/awg-server-tools/releases/download/boringtun-cli-0.0.1-gfedcba987654-b1"
 inconsistent_installer "a latest-release URL is inconsistent" "AWG_BT_RELEASE_BASE_URL" \
-	BASE_URL "https://github.com/wiresock/amneziawg-install/releases/latest/download"
+	BASE_URL "https://github.com/wiresock/awg-server-tools/releases/latest/download"
 inconsistent_installer "a download URL of another repository is inconsistent" "AWG_BT_RELEASE_BASE_URL" \
 	BASE_URL "https://github.com/example/amneziawg-install/releases/download/${AWG_BT_RELEASE_TAG}"
 inconsistent_installer "a plain-HTTP download URL is inconsistent" "AWG_BT_RELEASE_BASE_URL" \
-	BASE_URL "http://github.com/wiresock/amneziawg-install/releases/download/${AWG_BT_RELEASE_TAG}"
+	BASE_URL "http://github.com/wiresock/awg-server-tools/releases/download/${AWG_BT_RELEASE_TAG}"
 inconsistent_installer "the aarch64 asset as the x86_64 asset is inconsistent" "AWG_BT_RELEASE_ASSET_X86_64" \
 	ASSET_X86_64 "${AWG_BT_RELEASE_ASSET_AARCH64}"
 inconsistent_installer "an asset of another commit is inconsistent" "AWG_BT_RELEASE_ASSET_AARCH64" \
@@ -233,6 +233,21 @@ assert_contains "AWG_BT_RELEASE_SOURCE_COMMIT is assigned 0 times, not once" "$(
 	"  without a build number, every other name is still required"
 assert_contains "is not an embedded release format" "$(_btc_embedded_release_problems "${INSTALLER}" another-format)" \
 	"an unknown embedded release format is a problem, never a pass"
+# Installers released before the repository rename must still validate for
+# live upgrade tests. Only the two exact repository URLs are accepted, and
+# the historical URL must still point to the embedded immutable release tag.
+sed "s|^AWG_BT_RELEASE_BASE_URL=.*\$|AWG_BT_RELEASE_BASE_URL=\"https://github.com/wiresock/amneziawg-install/releases/download/${AWG_BT_RELEASE_TAG}\"|" \
+	"${INSTALLER}" >"${T}/legacy-repository-installer.sh"
+assert_eq "" "$(btc_embedded_release_problems "${T}/legacy-repository-installer.sh")" \
+	"an installer from before the repository rename retains a valid release URL"
+buildless_installer "${T}/buildless-installer.sh" 's|wiresock/awg-server-tools/releases/download|wiresock/amneziawg-install/releases/download|'
+assert_eq "" "$(btc_buildless_embedded_release_problems "${T}/buildless-installer.sh")" \
+	"an installer without a build number also retains its historical repository URL"
+sed 's|/releases/download/boringtun-cli-|/releases/download/wrong-tag-boringtun-cli-|' \
+	"${T}/legacy-repository-installer.sh" >"${T}/wrong-legacy-release.sh"
+assert_contains "AWG_BT_RELEASE_BASE_URL" "$(btc_embedded_release_problems "${T}/wrong-legacy-release.sh")" \
+	"the historical repository URL cannot bypass the exact release-tag check"
+rm -f -- "${T}/legacy-repository-installer.sh" "${T}/wrong-legacy-release.sh"
 rm -f -- "${T}/buildless-installer.sh"
 
 assert_eq "0" "$(grep -cE 'releases/latest|api\.github\.com|actions/artifacts' "${INSTALLER}")" \

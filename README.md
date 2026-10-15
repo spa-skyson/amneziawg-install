@@ -1,4 +1,6 @@
-# AmneziaWG Installer
+# AmneziaWG Server Tools
+
+Install and manage AmneziaWG servers, clients, and protocol imitation. By [WireSock](https://www.wiresock.net/).
 
 Set up an [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/) obfuscated VPN on a supported Linux server using the default kernel backend or the experimental **BoringTun userspace backend**. Fresh installs use AWG 2.0; AWG 3.1, a web panel, and protocol imitation are optional.
 
@@ -7,6 +9,11 @@ Choose backend → Install VPN → (optional) Web panel → Manage clients
 ```
 
 ---
+
+The repository was renamed from `wiresock/amneziawg-install` to
+`wiresock/awg-server-tools`. Existing installations keep the same commands,
+services, and paths. See [repository rename and compatibility](docs/REPOSITORY_RENAME.md)
+for updating Git remotes and verifying older releases.
 
 ## 📖 Background
 
@@ -28,7 +35,7 @@ Once the installer was solid, it was hard to stop:
 **VPN only (required):**
 
 ```bash
-curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-install.sh
+curl -fLO https://raw.githubusercontent.com/wiresock/awg-server-tools/main/amneziawg-install.sh
 chmod +x amneziawg-install.sh
 ```
 
@@ -55,7 +62,7 @@ installation. See [BoringTun requirements and lifecycle](#-experimental-boringtu
 **Add the web panel (optional):**
 
 ```bash
-curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-web.sh
+curl -fLO https://raw.githubusercontent.com/wiresock/awg-server-tools/main/amneziawg-web.sh
 chmod +x amneziawg-web.sh
 sudo ./amneziawg-web.sh install
 ```
@@ -76,7 +83,7 @@ The pinned BoringTun release has no per-client **Auto** mode; see
 **Add the obfuscation proxy (optional, kernel backend with AWG 2.0 only):**
 
 ```bash
-curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-proxy.sh
+curl -fLO https://raw.githubusercontent.com/wiresock/awg-server-tools/main/amneziawg-proxy.sh
 chmod +x amneziawg-proxy.sh
 sudo ./amneziawg-proxy.sh
 ```
@@ -137,8 +144,8 @@ sudo ./amneziawg-proxy.sh
 Use the **[Quick Start](#-quick-start)** commands above, or clone the repository (best for teams or repeated upgrades):
 
 ```bash
-git clone https://github.com/wiresock/amneziawg-install.git
-cd amneziawg-install
+git clone https://github.com/wiresock/awg-server-tools.git
+cd awg-server-tools
 sudo ./amneziawg-install.sh
 sudo ./amneziawg-web.sh install
 ```
@@ -201,7 +208,7 @@ The proxy installer detects the AWG interface, rebinds AmneziaWG to loopback,
 builds the binary, and installs a systemd service. One command does it all:
 
 ```bash
-curl -O https://raw.githubusercontent.com/wiresock/amneziawg-install/main/amneziawg-proxy.sh
+curl -fLO https://raw.githubusercontent.com/wiresock/awg-server-tools/main/amneziawg-proxy.sh
 chmod +x amneziawg-proxy.sh
 sudo ./amneziawg-proxy.sh
 ```
@@ -552,7 +559,7 @@ architectures are refused before anything is changed.
   kernel module package (`amneziawg-dkms`) is not pulled in, plus `nftables`,
   `iptables` and `qrencode`. No `amneziawg`, DKMS, headers or `deb-src` sources.
 - `boringtun-cli` from this repository's immutable public release
-  [`boringtun-cli-0.7.1-gb94943906b11-b1`](https://github.com/wiresock/amneziawg-install/releases/tag/boringtun-cli-0.7.1-gb94943906b11-b1),
+  [`boringtun-cli-0.7.1-gb94943906b11-b1`](https://github.com/wiresock/awg-server-tools/releases/tag/boringtun-cli-0.7.1-gb94943906b11-b1),
   built from WireSock BoringTun `b94943906b11641e274b3c950cc905aaf1631c59`. The
   installer downloads the archive for its architecture from that exact URL and
   checks it against SHA-256 values embedded in the script before extracting

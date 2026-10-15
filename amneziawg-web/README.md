@@ -3,7 +3,7 @@
 A self-hosted web panel for **visibility and management** of
 [AmneziaWG (AWG)](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module)
 installations managed via the
-[amneziawg-install](https://github.com/wiresock/amneziawg-install) script.
+[AmneziaWG Server Tools](https://github.com/wiresock/awg-server-tools) installer (`amneziawg-install.sh`).
 
 The panel header identifies the product as **AmneziaWG Server Tools** by
 [WireSock](https://www.wiresock.net/). The product name returns to **Peers**;
@@ -145,8 +145,8 @@ The installer lives at the repository root, next to `amneziawg-install.sh`.
 If you run it from a repository checkout, it auto-detects `./amneziawg-web` and builds from source automatically:
 
 ```bash
-git clone https://github.com/wiresock/amneziawg-install.git
-cd amneziawg-install
+git clone https://github.com/wiresock/awg-server-tools.git
+cd awg-server-tools
 
 # 1. Install AmneziaWG (if not already done)
 sudo ./amneziawg-install.sh
