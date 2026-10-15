@@ -3009,18 +3009,34 @@ function recommendedMtuForS4() { # <S4> [path MTU, default 1500]
 		echo "ERROR: recommendedMtuForS4 needs a decimal path MTU, got '${PATH_MTU}'." >&2
 		return 1
 	fi
-	MTU=$((PATH_MTU - AWG_QUICK_MTU_OVERHEAD - S4))
+	MTU=$((10#${PATH_MTU} - AWG_QUICK_MTU_OVERHEAD - 10#${S4}))
 	(( MTU >= AWG_MIN_MTU )) || MTU=${AWG_MIN_MTU}
 	printf '%s' "${MTU}"
 }
 
-# The MTU of the uplink NIC, where awg-quick's automatic MTU starts from, read
-# from sysfs; 1500 when the NIC is unknown or the value unusable, as in test
-# environments.
+# Preserve explicit default-route MTUs before falling back to the NIC MTU.
+# A server can serve peers over either family, so use the smallest route MTU
+# on its uplink across IPv4 and IPv6. Fall back to sysfs, then 1500.
 function uplinkMtu() { # <nic>
-	local NIC="${1:-}" MTU=""
-	if [[ -n "${NIC}" && "${NIC}" != */* && -r "/sys/class/net/${NIC}/mtu" ]]; then
-		read -r MTU <"/sys/class/net/${NIC}/mtu" || true
+	local NIC="${1:-}" MTU="" FAMILY ROUTE ROUTE_MTU
+	if [[ -n "${NIC}" && "${NIC}" != */* ]]; then
+		for FAMILY in -4 -6; do
+			while IFS= read -r ROUTE; do
+				if [[ "${ROUTE}" =~ (^|[[:space:]])mtu[[:space:]]+(lock[[:space:]]+)?([0-9]{1,5})($|[[:space:]]) ]]; then
+					ROUTE_MTU=$((10#${BASH_REMATCH[3]}))
+					if (( ROUTE_MTU > 0 )) && { [[ -z "${MTU}" ]] || (( ROUTE_MTU < MTU )); }; then
+						MTU="${ROUTE_MTU}"
+					fi
+				fi
+			done < <(ip "${FAMILY}" route show default dev "${NIC}" 2>/dev/null || true)
+		done
+		if [[ -n "${MTU}" ]]; then
+			printf '%s' "${MTU}"
+			return
+		fi
+		if [[ -r "/sys/class/net/${NIC}/mtu" ]]; then
+			read -r MTU <"/sys/class/net/${NIC}/mtu" || true
+		fi
 	fi
 	if [[ "${MTU}" =~ ^[0-9]+$ ]] && (( MTU >= AWG_MIN_MTU )); then
 		printf '%s' "${MTU}"
@@ -8085,15 +8101,19 @@ function readS3AndS4() {
 	S4_MAX="$(s4MaxForEndpoint "${SERVER_PUB_IP:-}")"
 	SERVER_AWG_S3=0
 	SERVER_AWG_S4=0
-	until [[ ${SERVER_AWG_S3} =~ ^[0-9]+$ ]] && (( ${SERVER_AWG_S3} >= 15 )) && (( ${SERVER_AWG_S3} <= 150 )); do
+	# Bound the significant digits before arithmetic so oversized input cannot
+	# wrap into range; 10# keeps leading zeros decimal, as upstream parses them.
+	until [[ ${SERVER_AWG_S3} =~ ^0*[0-9]{1,3}$ ]] && (( 10#${SERVER_AWG_S3} >= 15 )) && (( 10#${SERVER_AWG_S3} <= 150 )); do
 		read -rp "Server AmneziaWG S3 [15-150]: " -e -i "${RANDOM_AWG_S3}" SERVER_AWG_S3
 	done
-	until [[ ${SERVER_AWG_S4} =~ ^[0-9]+$ ]] && (( ${SERVER_AWG_S4} >= 15 )) && (( ${SERVER_AWG_S4} <= S4_MAX )); do
+	until [[ ${SERVER_AWG_S4} =~ ^0*[0-9]{1,3}$ ]] && (( 10#${SERVER_AWG_S4} >= 15 )) && (( 10#${SERVER_AWG_S4} <= S4_MAX )); do
 		read -rp "Server AmneziaWG S4 [15-${S4_MAX}]: " -e -i "${RANDOM_AWG_S4}" SERVER_AWG_S4
-		if [[ ${SERVER_AWG_S4} =~ ^[0-9]+$ ]] && (( SERVER_AWG_S4 > S4_MAX && SERVER_AWG_S4 <= AWG_S4_MAX )); then
+		if [[ ${SERVER_AWG_S4} =~ ^0*[0-9]{1,3}$ ]] && (( 10#${SERVER_AWG_S4} > S4_MAX && 10#${SERVER_AWG_S4} <= AWG_S4_MAX )); then
 			echo "S4 stays at or below ${S4_MAX} behind an IPv6 endpoint or a hostname: even at the 1280 minimum MTU, a larger S4 pushes full-size transport packets past 1500 bytes on the wire."
 		fi
 	done
+	SERVER_AWG_S3=$((10#${SERVER_AWG_S3}))
+	SERVER_AWG_S4=$((10#${SERVER_AWG_S4}))
 }
 
 # Parse a range string "min-max" or single value into MIN and MAX variables
@@ -8547,7 +8567,7 @@ function askClientMtu() {
 		IFS= read -rp "Client MTU (1280-65535, empty for automatic): " -e -i "${CLIENT_MTU:-${RECOMMENDED_MTU}}" CLIENT_MTU || exit 1
 		validateClientMtu && break
 	done
-	if [[ -z "${CLIENT_MTU}" ]] && (( SERVER_AWG_S4 > S4_LIMIT )); then
+	if [[ -z "${CLIENT_MTU}" ]] && (( 10#${SERVER_AWG_S4} > S4_LIMIT )); then
 		echo -e "${ORANGE}WARNING: with S4 = ${SERVER_AWG_S4} and an automatic MTU, full-size transport packets exceed 1500 bytes on the wire and fragment: the automatic MTU tolerates S4 up to ${AWG_S4_AUTOMATIC_MTU_LIMIT_IPV4} behind an IPv4 endpoint and none behind an IPv6 endpoint or a hostname.${NC}"
 		echo -e "${ORANGE}         Set MTU = ${RECOMMENDED_MTU} in the client configs if connections stall.${NC}"
 	fi
@@ -10815,10 +10835,10 @@ function migrateS3S4() {
 	# If both S3/S4 are present, validate them before skipping migration.
 	# This catches invalid values from manual edits or partial writes.
 	if [[ -n "${SERVER_AWG_S3}" ]] && [[ -n "${SERVER_AWG_S4}" ]]; then
-		if [[ "${SERVER_AWG_S3}" =~ ^[0-9]+$ ]] && [[ "${SERVER_AWG_S4}" =~ ^[0-9]+$ ]] && \
-		   (( SERVER_AWG_S3 >= 15 )) && (( SERVER_AWG_S3 <= 150 )) && \
-		   (( SERVER_AWG_S4 >= 15 )) && (( SERVER_AWG_S4 <= 150 )) && \
-		   (( SERVER_AWG_S3 + 56 != SERVER_AWG_S4 )) && (( SERVER_AWG_S4 + 56 != SERVER_AWG_S3 )); then
+		if [[ "${SERVER_AWG_S3}" =~ ^0*[0-9]{1,3}$ ]] && [[ "${SERVER_AWG_S4}" =~ ^0*[0-9]{1,3}$ ]] && \
+		   (( 10#${SERVER_AWG_S3} >= 15 )) && (( 10#${SERVER_AWG_S3} <= 150 )) && \
+		   (( 10#${SERVER_AWG_S4} >= 15 )) && (( 10#${SERVER_AWG_S4} <= 150 )) && \
+		   (( 10#${SERVER_AWG_S3} + 56 != 10#${SERVER_AWG_S4} )) && (( 10#${SERVER_AWG_S4} + 56 != 10#${SERVER_AWG_S3} )); then
 			return 1
 		fi
 		# Values are present but invalid — clear them so the logic below regenerates
@@ -10835,10 +10855,10 @@ function migrateS3S4() {
 	if [[ -n "${CONF_S3}" ]] && [[ -n "${CONF_S4}" ]]; then
 		# Validate that loaded values are numeric, within valid range [15-150],
 		# and satisfy the bidirectional constraint S3 + 56 != S4 and S4 + 56 != S3
-		if [[ "${CONF_S3}" =~ ^[0-9]+$ ]] && [[ "${CONF_S4}" =~ ^[0-9]+$ ]] && \
-		   (( CONF_S3 >= 15 )) && (( CONF_S3 <= 150 )) && \
-		   (( CONF_S4 >= 15 )) && (( CONF_S4 <= 150 )) && \
-		   (( CONF_S3 + 56 != CONF_S4 )) && (( CONF_S4 + 56 != CONF_S3 )); then
+		if [[ "${CONF_S3}" =~ ^0*[0-9]{1,3}$ ]] && [[ "${CONF_S4}" =~ ^0*[0-9]{1,3}$ ]] && \
+		   (( 10#${CONF_S3} >= 15 )) && (( 10#${CONF_S3} <= 150 )) && \
+		   (( 10#${CONF_S4} >= 15 )) && (( 10#${CONF_S4} <= 150 )) && \
+		   (( 10#${CONF_S3} + 56 != 10#${CONF_S4} )) && (( 10#${CONF_S4} + 56 != 10#${CONF_S3} )); then
 			SERVER_AWG_S3="${CONF_S3}"
 			SERVER_AWG_S4="${CONF_S4}"
 		else

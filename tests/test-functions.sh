@@ -446,11 +446,11 @@ echo "=== recommendedMtuForS4 ==="
 # awg-quick's automatic MTU is the path MTU minus 80 (1420 on a 1500-byte
 # path) and ignores the S4 junk bytes, so they come off it too, down to the
 # 1280 IPv6 minimum.
-for MTU_CASE in 15:1405 20:1400 21:1399 100:1320 140:1280 141:1280 150:1280 0:1420 200:1280; do
+for MTU_CASE in 15:1405 20:1400 21:1399 100:1320 140:1280 141:1280 150:1280 0:1420 200:1280 0120:1300 08:1412 09:1411; do
 	assert_eq "${MTU_CASE#*:}" "$(recommendedMtuForS4 "${MTU_CASE%%:*}")" "recommended MTU for S4=${MTU_CASE%%:*}"
 done
 # An explicit path MTU, as the server interface passes its uplink's.
-for MTU_CASE in 15:1500:1405 15:1400:1305 100:1400:1280 120:1450:1280 15:9000:8905 15:1280:1280; do
+for MTU_CASE in 15:1500:1405 15:1400:1305 100:1400:1280 120:1450:1280 15:9000:8905 15:1280:1280 0120:01500:1300; do
 	IFS=: read -r MTU_S4 MTU_PATH MTU_WANT <<<"${MTU_CASE}"
 	assert_eq "${MTU_WANT}" "$(recommendedMtuForS4 "${MTU_S4}" "${MTU_PATH}")" "recommended MTU for S4=${MTU_S4} on a ${MTU_PATH}-byte path"
 done
@@ -504,6 +504,8 @@ _read_s3s4() ( # <SERVER_PUB_IP> <answers>
 	local dir; dir="$(mktemp -d)"
 	trap 'rm -rf "${dir}"' EXIT
 	SERVER_PUB_IP="$1"; RANDOM_AWG_S3=45; RANDOM_AWG_S4=100
+	# A rejected final answer must fail the fixture instead of looping at EOF.
+	read() { builtin read "$@" || exit 1; }
 	readS3AndS4 >"${dir}/stdout" 2>/dev/null <<<"$2" || exit 1
 	printf '%s|%s|%s' "${SERVER_AWG_S3}" "${SERVER_AWG_S4}" "$(grep -c '^S4 stays at or below 140 behind an IPv6 endpoint or a hostname' "${dir}/stdout" || true)"
 )
@@ -513,12 +515,19 @@ assert_eq '45|140|1' "$(_read_s3s4 2001:db8::1 $'45\n141\n140')" "S4 141 is refu
 assert_eq '45|140|1' "$(_read_s3s4 vpn.example.com $'45\n150\n140')" "S4 150 is refused behind a hostname"
 assert_eq '45|140|0' "$(_read_s3s4 2001:db8::1 $'45\n140')" "S4 140 is accepted behind an IPv6 endpoint without a reason"
 assert_eq '45|15|0' "$(_read_s3s4 2001:db8::1 $'45\n151\n15')" "S4 above the protocol range gets the plain re-prompt"
+assert_eq '45|120|0' "$(_read_s3s4 2001:db8::1 $'045\n0120')" "zero-prefixed S3 and S4 are accepted as decimal values"
+assert_eq '45|19|0' "$(_read_s3s4 2001:db8::1 $'45\n019')" "S4 containing 9 is accepted without octal arithmetic"
+assert_eq '45|140|1' "$(_read_s3s4 2001:db8::1 $'45\n0141\n140')" "zero-prefixed S4 cannot bypass the IPv6 maximum"
+assert_eq '45|140|1' "$(_read_s3s4 vpn.example.com $'45\n0150\n140')" "zero-prefixed S4 cannot bypass the hostname maximum"
+assert_eq '45|150|0' "$(_read_s3s4 198.51.100.1 $'45\n0151\n150')" "zero-prefixed S4 cannot bypass the protocol maximum"
+assert_eq '45|120|0' "$(_read_s3s4 198.51.100.1 $'45\n18446744073709551736\n120')" "overflowing S4 cannot wrap into the accepted range"
+assert_eq 1 "$(SERVER_PUB_IP=198.51.100.1; SERVER_AWG_S4=021; CLIENT_MTU=''; askClientMtu <<<'' | grep -c 'WARNING: with S4')" "automatic client MTU warns for decimal S4 021 above the IPv4 limit"
 
 echo "=== renderAwgServerInterface ==="
-_render_server_interface() ( # <S4> <ENABLE_IPV6> [uplink MTU]
+_render_server_interface() ( # <S4> <ENABLE_IPV6> [uplink MTU] [NIC]
 	# The uplink NIC does not exist, so the sysfs read falls back to 1500
 	# unless a third argument stands in for the uplink's MTU.
-	SERVER_PUB_NIC=mocknic0
+	SERVER_PUB_NIC="${4:-mocknic0}"
 	if [[ -n "${3:-}" ]]; then eval "uplinkMtu() { printf '%s' '$3'; }"; fi
 	SERVER_AWG_IPV4=10.66.66.1; SERVER_AWG_IPV6="fd42:42:42::1"; ENABLE_IPV6="$2"
 	SERVER_PORT=51820; SERVER_PRIV_KEY=SRVPRIV
@@ -548,11 +557,56 @@ assert_eq "MTU = 1280" "$(_render_server_interface 150 n | grep '^MTU')" "the se
 assert_eq "MTU = 1305" "$(_render_server_interface 15 y 1400 | grep '^MTU')" "the server MTU starts from a smaller uplink MTU"
 assert_eq "MTU = 1280" "$(_render_server_interface 120 y 1400 | grep '^MTU')" "a small uplink with a large S4 stops at 1280"
 assert_eq "MTU = 1385" "$(_render_server_interface 15 y 1480 | grep '^MTU')" "the server MTU follows the uplink MTU exactly"
+assert_eq "MTU = 1300" "$(_render_server_interface 0120 y | grep '^MTU')" "the server MTU subtracts decimal S4 even with leading zeros"
+_render_server_with_routes() ( # <IPv4 default routes> <IPv6 default routes>
+	local route4="$1" route6="$2"
+	# Only route discovery is replaced. The real lo sysfs MTU is larger than
+	# these route MTUs, so falling back to the NIC loses the path constraint.
+	ip() {
+		case "$*" in
+			'-4 route show default dev lo') printf '%s\n' "${route4}";;
+			'-6 route show default dev lo') printf '%s\n' "${route6}";;
+			*) return 1;;
+		esac
+	}
+	_render_server_interface 15 y '' lo | grep '^MTU'
+)
+assert_eq 'MTU = 1305' "$(_render_server_with_routes 'default via 192.0.2.254 dev lo mtu 1400' '')" "IPv4 route MTU takes precedence over the larger NIC MTU"
+assert_eq 'MTU = 1305' "$(_render_server_with_routes '' 'default via fe80::1 dev lo proto ra metric 1024 mtu 1400 pref medium')" "IPv6 route MTU takes precedence over the larger NIC MTU"
+assert_eq 'MTU = 1305' "$(_render_server_with_routes 'default via 192.0.2.254 dev lo mtu 1500' 'default via fe80::1 dev lo mtu lock 1400')" "dual-stack uplink uses its smaller route MTU, including locked MTUs"
+assert_eq 'MTU = 1305' "$(_render_server_with_routes $'default via 192.0.2.1 dev lo mtu 1450\ndefault via 192.0.2.2 dev lo mtu 1400' '')" "multiple default routes keep the smallest explicit MTU"
+assert_eq 'MTU = 1280' "$(_render_server_with_routes 'default via 192.0.2.254 dev lo mtu 1200' '')" "a route below the tunnel minimum retains the existing 1280 clamp"
+assert_eq "MTU = $(($(cat /sys/class/net/lo/mtu) - 95))" "$(_render_server_with_routes 'default via 192.0.2.254 dev lo' '')" "a default route without an MTU falls back to the NIC"
+assert_eq "MTU = $(($(cat /sys/class/net/lo/mtu) - 95))" "$(_render_server_with_routes 'default via 192.0.2.254 dev lo mtu invalid' 'default via fe80::1 dev lo mtu 0')" "unusable route MTUs fall back to the NIC"
 assert_eq "Address = 10.66.66.1/24" "$(_render_server_interface 150 n | grep '^Address')" "an IPv4-only server keeps its IPv4-only address"
 MTU_RC=0
 MTU_RENDER_OUT="$(_render_server_interface '' y 2>/dev/null)" || MTU_RC=$?
 assert_eq "1|" "${MTU_RC}|${MTU_RENDER_OUT}" "an unusable S4 fails the server render without output"
 unset MTU_RC MTU_RENDER_OUT
+
+echo "=== decimal S3/S4 migration validation ==="
+_migrate_decimal_s3s4() ( # <params|config> <S3> <S4>
+	local dir rc=0; dir="$(mktemp -d)"
+	trap 'rm -rf "${dir}"' EXIT
+	SERVER_AWG_CONF="${dir}/awg0.conf"
+	SERVER_AWG_S3=''; SERVER_AWG_S4=''
+	if [[ "$1" == params ]]; then
+		SERVER_AWG_S3="$2"; SERVER_AWG_S4="$3"
+		: >"${SERVER_AWG_CONF}"
+	else
+		printf 'S3 = %s\nS4 = %s\n' "$2" "$3" >"${SERVER_AWG_CONF}"
+	fi
+	generateS3AndS4() { RANDOM_AWG_S3=45; RANDOM_AWG_S4=120; }
+	migrateS3S4 || rc=$?
+	printf '%s|%s|%s' "${rc}" "${SERVER_AWG_S3}" "${SERVER_AWG_S4}"
+)
+for S4_SOURCE in params config; do
+	assert_eq '0|45|120' "$(_migrate_decimal_s3s4 "${S4_SOURCE}" 45 0151)" "${S4_SOURCE}: migration rejects decimal S4 above 150"
+	assert_eq '0|45|120' "$(_migrate_decimal_s3s4 "${S4_SOURCE}" 045 0101)" "${S4_SOURCE}: migration rejects the decimal S3 plus 56 collision"
+	assert_eq '0|45|120' "$(_migrate_decimal_s3s4 "${S4_SOURCE}" 0101 045)" "${S4_SOURCE}: migration rejects the decimal S4 plus 56 collision"
+	assert_eq '0|45|120' "$(_migrate_decimal_s3s4 "${S4_SOURCE}" 45 18446744073709551736)" "${S4_SOURCE}: migration rejects overflowing S4"
+done
+unset S4_SOURCE
 
 echo "=== pre-2.0 migration recommends an MTU for a new S4 ==="
 # The migration is the one path that gives an existing server a new S4. It
