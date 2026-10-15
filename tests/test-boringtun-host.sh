@@ -1563,6 +1563,22 @@ assert_not_contains "params present at package removal" "$(cat "${S}/un")" "the 
 OS=debian AWG_BACKEND=kernel RUN_INPUT=y run uninstall_flow
 assert_eq "remove-packages amneziawg amneziawg-tools" "$(grep '^remove-packages' "${S}/un")" \
 	"Debian kernel uninstall keeps removing exactly its two packages"
+# The config of a tunnel set up by hand next to the managed awg0, such as the
+# upstream side of a two-hop server (#158), survives either uninstall.
+for UN_BACKEND in boringtun kernel; do
+	mkdir -p "${AMNEZIAWG_DIR}/clients"
+	printf '[Interface]\nPrivateKey = UPSTREAM\n' >"${AMNEZIAWG_DIR}/awg1.conf"
+	: >"${AMNEZIAWG_DIR}/awg0.conf"
+	: >"${AMNEZIAWG_DIR}/awg0.boringtun"
+	: >"${AMNEZIAWG_DIR}/clients/awg0-client-alice.conf"
+	: >"${S}/un"
+	OS=ubuntu AWG_BACKEND="${UN_BACKEND}" RUN_INPUT=y run uninstall_flow
+	assert_rc 0 "${RC}" "${UN_BACKEND}: an uninstall next to a hand-made tunnel succeeds"
+	assert_eq "awg1.conf" "$(ls -A "${AMNEZIAWG_DIR}" 2>/dev/null)" "  and removes only its own configuration"
+	assert_eq $'[Interface]\nPrivateKey = UPSTREAM' "$(cat "${AMNEZIAWG_DIR}/awg1.conf" 2>/dev/null)" "  the tunnel's config is unchanged"
+	assert_contains "awg1.conf, which this installation did not create" "${OUT}" "  and the operator is told"
+	rm -rf "${AMNEZIAWG_DIR}"
+done
 # S3: a failed package or repository step keeps the configuration.
 for FAILING in PACKAGES_RC PPA_RC; do
 	: >"${S}/un"

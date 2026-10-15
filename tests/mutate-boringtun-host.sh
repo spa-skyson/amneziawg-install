@@ -240,8 +240,8 @@ mutant_expect helper_rm_ignored test-boringtun-host "${INSTALLER}" "S2: a genera
 	'_awgBtRemoveGeneratedHelper "${AWG_BT_LIBEXEC_DIR}/awg-backend-ctl" ctl'
 # S3: the configuration goes last, and only after every step succeeded.
 mutant_expect config_removed_before_packages test-boringtun-host "${INSTALLER}" "the configuration is still there while packages are removed" \
-	$'\t\tif [[ "${AWG_BACKEND}" != "${AWG_BACKEND_BORINGTUN}" ]]; then\n\t\t\trm -rf "${AMNEZIAWG_DIR:?}"' \
-	$'\t\tif true; then\n\t\t\trm -rf "${AMNEZIAWG_DIR:?}"'
+	$'\t\tif [[ "${AWG_BACKEND}" != "${AWG_BACKEND_BORINGTUN}" ]]; then\n\t\t\tremoveAwgInstallConfig || UNINSTALL_FAILED=1' \
+	$'\t\tif true; then\n\t\t\tremoveAwgInstallConfig || UNINSTALL_FAILED=1'
 mutant_expect config_removed_after_failure test-boringtun-host "${INSTALLER}" "and keeps params, so a rerun uninstalls again" \
 	$'\t\t\tif [[ ${AWG_RUNNING} -eq 0 || ${UNINSTALL_FAILED} -ne 0 ]]; then\n\t\t\t\techo -e "${ORANGE}The configuration in' \
 	$'\t\t\tif false; then\n\t\t\t\techo -e "${ORANGE}The configuration in'

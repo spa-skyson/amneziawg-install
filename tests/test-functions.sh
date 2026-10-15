@@ -948,6 +948,44 @@ assert_eq "0|changed|written|0" "$(_check_managed_client_add SRVPRIV interactive
 rm -rf "${NIAC_MANAGED_BIN}"
 unset NIAC_MANAGED_BIN
 
+echo "=== uninstall removes only the installation's own configuration ==="
+# The managed interface is awg1. Each argument is an entry to create in the
+# config directory (a trailing / makes a directory with a file in it); the
+# first names the entry whose removal fails, or is empty. Result: exit code |
+# what is left in the directory, or "gone" | "left in place" notes.
+_check_remove_config() ( # <entry rm fails on, or ""> <entry...>
+	local fail="$1" dir entry rc=0
+	shift
+	dir="$(mktemp -d)"
+	trap 'rm -rf "${dir}"' EXIT
+	AMNEZIAWG_DIR="${dir}/amneziawg"; SERVER_AWG_NIC=awg1
+	mkdir -p "${AMNEZIAWG_DIR}"
+	for entry in "$@"; do
+		case "${entry}" in
+			*/) mkdir -p "${AMNEZIAWG_DIR}/${entry}" && : >"${AMNEZIAWG_DIR}/${entry}file" ;;
+			*) printf 'x\n' >"${AMNEZIAWG_DIR}/${entry}" ;;
+		esac
+	done
+	if [[ -n "${fail}" ]]; then
+		eval "rm() { [[ \"\${*: -1}\" == '${AMNEZIAWG_DIR}/${fail}' ]] && return 1; command rm \"\$@\"; }"
+	fi
+	removeAwgInstallConfig >"${dir}/out" 2>&1 || rc=$?
+	printf '%s|%s|%s' "${rc}" \
+		"$(if [[ -d "${AMNEZIAWG_DIR}" ]]; then LC_ALL=C ls -A "${AMNEZIAWG_DIR}" | tr '\n' ' '; else echo gone; fi)" \
+		"$(grep -c 'left in place' "${dir}/out" || true)"
+)
+REMOVE_CONFIG_OWN=(params params.bak params.tmp.Ab12 params.Cd34 awg1.conf awg1.conf.bak awg1.conf.tmp.Ef56
+	awg1.boringtun clients/ .awg1.web.lock .awg1.sync.Gh78 .awg-protocol.Ij90/ .awg-imitation.Kl12/)
+assert_eq "0|gone|0" "$(_check_remove_config '' "${REMOVE_CONFIG_OWN[@]}")" \
+	"uninstall removes every entry of its own and then the directory"
+assert_eq "0|.awg0.web.lock awg0.conf awg0.conf.bak awg1.1.conf awg10.conf notes |1" \
+	"$(_check_remove_config '' "${REMOVE_CONFIG_OWN[@]}" awg0.conf awg0.conf.bak .awg0.web.lock awg10.conf awg1.1.conf notes)" \
+	"uninstall leaves another tunnel's config, its files and the directory, and says so"
+assert_eq "1|awg1.conf params |0" "$(_check_remove_config awg1.conf params awg1.conf awg1.boringtun)" \
+	"an own entry that cannot be removed fails the removal and keeps params for a rerun"
+assert_eq "0|gone|0" "$(_check_remove_config '')" "an empty config directory is removed"
+unset REMOVE_CONFIG_OWN
+
 echo "=== formatClientAllowedIPs ==="
 assert_eq "0.0.0.0/0, ::/0" "$(formatClientAllowedIPs "0.0.0.0/0,::/0")" "formatClientAllowedIPs adds space after comma"
 assert_eq "0.0.0.0/0, ::/0" "$(formatClientAllowedIPs " 0.0.0.0/0, ::/0 ")" "formatClientAllowedIPs trims entries"

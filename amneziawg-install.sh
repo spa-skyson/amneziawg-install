@@ -10600,10 +10600,67 @@ function boringtunServiceInactive() { # <interface>
 	esac
 }
 
+# Whether NAME, an entry of AMNEZIAWG_DIR, belongs to the installation of
+# INTERFACE: params and its backup and temporary copies, the interface's
+# config with its backups and the web helper's temporary copies, its BoringTun
+# runtime file, the client configs, retained protocol and imitation
+# transactions, and the web helper's lock and sync files for the interface.
+function awgConfigEntryOwned() { # <name> <interface>
+	case "$1" in
+		params | params.* | clients | .awg-protocol.* | .awg-imitation.* | \
+			"$2.conf" | "$2.conf".* | "$2.boringtun" | ".$2".*)
+			return 0
+			;;
+	esac
+	return 1
+}
+
+# Remove the installation's own entries of AMNEZIAWG_DIR, params last, so that
+# a failure keeps params for a rerun of the uninstall. Anything else there,
+# such as the config of a tunnel set up by hand (issue #158), stays, and so
+# does the directory then. Fails when an own entry could not be removed.
+function removeAwgInstallConfig() {
+	local ENTRY NAME LEFT="" KEPT=""
+	local -a OWN=() PARAMS=()
+	[[ -e "${AMNEZIAWG_DIR}" || -L "${AMNEZIAWG_DIR}" ]] || return 0
+	while IFS= read -r -d '' ENTRY; do
+		NAME="${ENTRY##*/}"
+		if ! awgConfigEntryOwned "${NAME}" "${SERVER_AWG_NIC:?}"; then
+			KEPT+=" ${NAME}"
+		elif [[ "${NAME}" == params || "${NAME}" == params.* ]]; then
+			PARAMS+=("${ENTRY}")
+		else
+			OWN+=("${ENTRY}")
+		fi
+	done < <(find "${AMNEZIAWG_DIR}" -mindepth 1 -maxdepth 1 -print0)
+	for ENTRY in "${OWN[@]}"; do
+		rm -rf -- "${ENTRY}"
+		[[ ! -e "${ENTRY}" && ! -L "${ENTRY}" ]] || LEFT+=" ${ENTRY##*/}"
+	done
+	if [[ -z "${LEFT}" ]]; then
+		for ENTRY in "${PARAMS[@]}"; do
+			rm -f -- "${ENTRY}"
+			[[ ! -e "${ENTRY}" && ! -L "${ENTRY}" ]] || LEFT+=" ${ENTRY##*/}"
+		done
+	fi
+	if [[ -n "${LEFT}" ]]; then
+		echo -e "${RED}ERROR: could not remove${LEFT} from ${AMNEZIAWG_DIR}.${NC}"
+		return 1
+	fi
+	if [[ -n "${KEPT}" ]]; then
+		echo -e "${ORANGE}NOTE: ${AMNEZIAWG_DIR} also holds${KEPT}, which this installation did not create; it is left in place.${NC}"
+		return 0
+	fi
+	if ! rmdir -- "${AMNEZIAWG_DIR}"; then
+		echo -e "${RED}ERROR: ${AMNEZIAWG_DIR} could not be removed.${NC}"
+		return 1
+	fi
+}
+
 function uninstallAmneziaWG() {
 	echo ""
-	echo -e "\n${RED}WARNING: This will uninstall AmneziaWG and remove all the configuration files!${NC}"
-	echo -e "${ORANGE}Please backup the /etc/amnezia/amneziawg directory if you want to keep your configuration files.\n${NC}"
+	echo -e "\n${RED}WARNING: This will uninstall AmneziaWG and remove its configuration: params, ${SERVER_AWG_NIC}.conf and the client configs in ${AMNEZIAWG_DIR}!${NC}"
+	echo -e "${ORANGE}Please backup the ${AMNEZIAWG_DIR} directory if you want to keep your configuration files. Other files there are left in place.\n${NC}"
 	read -rp "Do you really want to remove AmneziaWG? [y/n]: " -e REMOVE
 	REMOVE=${REMOVE:-n}
 	if [[ $REMOVE == [yY] ]]; then
@@ -10690,7 +10747,7 @@ function uninstallAmneziaWG() {
 		# after its packages and repository entries are gone, so that until
 		# then a rerun finds params and uninstalls again.
 		if [[ "${AWG_BACKEND}" != "${AWG_BACKEND_BORINGTUN}" ]]; then
-			rm -rf "${AMNEZIAWG_DIR:?}"
+			removeAwgInstallConfig || UNINSTALL_FAILED=1
 		fi
 
 		# A BoringTun host installed only amneziawg-tools. Kernel module packages
@@ -10777,11 +10834,7 @@ function uninstallAmneziaWG() {
 			if [[ ${AWG_RUNNING} -eq 0 || ${UNINSTALL_FAILED} -ne 0 ]]; then
 				echo -e "${ORANGE}The configuration in ${AMNEZIAWG_DIR} was kept, so the uninstall can be run again.${NC}"
 			else
-				rm -rf "${AMNEZIAWG_DIR:?}"
-				if [[ -e "${AMNEZIAWG_DIR}" ]]; then
-					echo -e "${RED}ERROR: ${AMNEZIAWG_DIR} could not be removed.${NC}"
-					UNINSTALL_FAILED=1
-				fi
+				removeAwgInstallConfig || UNINSTALL_FAILED=1
 			fi
 		fi
 

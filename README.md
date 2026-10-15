@@ -409,7 +409,10 @@ installation before anything is installed; without one, the installer picks
 the first free `awgN` and says so. Later, every management action (adding,
 removing or regenerating clients, protocol changes, the web panel) refuses to
 change the config named by `SERVER_AWG_NIC` in params unless its
-`[Interface] PrivateKey` is the installation's `SERVER_PRIV_KEY`.
+`[Interface] PrivateKey` is the installation's `SERVER_PRIV_KEY`. Uninstalling
+removes only the installation's own files from `/etc/amnezia/amneziawg`
+(params, the server config, client configs and their backups); other configs
+there stay, and so does the directory then.
 
 Example:
 
