@@ -974,17 +974,34 @@ _check_remove_config() ( # <entry rm fails on, or ""> <entry...>
 		"$(if [[ -d "${AMNEZIAWG_DIR}" ]]; then LC_ALL=C ls -A "${AMNEZIAWG_DIR}" | tr '\n' ' '; else echo gone; fi)" \
 		"$(grep -c 'left in place' "${dir}/out" || true)"
 )
-REMOVE_CONFIG_OWN=(params params.bak params.tmp.Ab12 params.Cd34 awg1.conf awg1.conf.bak awg1.conf.tmp.Ef56
-	awg1.boringtun clients/ .awg1.web.lock .awg1.sync.Gh78 .awg-protocol.Ij90/ .awg-imitation.Kl12/)
+# Every name the installation writes there, with mktemp's six characters.
+REMOVE_CONFIG_OWN=(params params.bak params.tmp.Ab12Cd params.Cd34Ef .params.protocol.Ef56Gh .params.imitation.Gh78Ij
+	awg1.conf awg1.conf.bak awg1.conf.tmp.Ef56Gh .awg1.conf.protocol.Ij90Kl .awg1.conf.imitation.Kl12Mn
+	awg1.boringtun .awg1.boringtun.Mn34Op .awg1.boringtun.imitation.Op56Qr clients/ .awg1.web.lock .awg1.sync.Gh78Ij
+	.awg-protocol.Ij90Kl/ .awg-imitation.Kl12Mn/)
 assert_eq "0|gone|0" "$(_check_remove_config '' "${REMOVE_CONFIG_OWN[@]}")" \
 	"uninstall removes every entry of its own and then the directory"
 assert_eq "0|.awg0.web.lock awg0.conf awg0.conf.bak awg1.1.conf awg10.conf notes |1" \
 	"$(_check_remove_config '' "${REMOVE_CONFIG_OWN[@]}" awg0.conf awg0.conf.bak .awg0.web.lock awg10.conf awg1.1.conf notes)" \
 	"uninstall leaves another tunnel's config, its files and the directory, and says so"
+# Interface names may contain dots: params.conf and awg1.conf.conf are the
+# configs of interfaces named params and awg1.conf, never the installation's.
+# (A six-character suffix, as in params.backup, is the shape of a mktemp copy.)
+REMOVE_CONFIG_FOREIGN=(params.conf params.Ab12Cd.conf awg1.conf.conf awg1.conf.bak.conf awg1.boringtun.conf
+	.awg1.web.conf clients.conf params.old awg1.conf.orig .awg-protocol.x .params.protocol.short)
+assert_eq "0|$(printf '%s\n' "${REMOVE_CONFIG_FOREIGN[@]}" | LC_ALL=C sort | tr '\n' ' ')|1" \
+	"$(_check_remove_config '' "${REMOVE_CONFIG_OWN[@]}" "${REMOVE_CONFIG_FOREIGN[@]}")" \
+	"uninstall removes only the exact names it writes, never configs whose names merely start with them"
+# A failure keeps params with the server config, so the next run of the
+# installer loads the installation again and reruns the uninstall.
+assert_eq "1|awg1.conf clients params |0" "$(_check_remove_config clients params awg1.conf awg1.boringtun clients/)" \
+	"a client directory that cannot be removed keeps params and the server config for a rerun"
 assert_eq "1|awg1.conf params |0" "$(_check_remove_config awg1.conf params awg1.conf awg1.boringtun)" \
-	"an own entry that cannot be removed fails the removal and keeps params for a rerun"
+	"a server config that cannot be removed keeps params for a rerun"
+assert_eq "1|params |0" "$(_check_remove_config params params awg1.conf)" \
+	"params that cannot be removed fail the removal"
 assert_eq "0|gone|0" "$(_check_remove_config '')" "an empty config directory is removed"
-unset REMOVE_CONFIG_OWN
+unset REMOVE_CONFIG_OWN REMOVE_CONFIG_FOREIGN
 
 echo "=== formatClientAllowedIPs ==="
 assert_eq "0.0.0.0/0, ::/0" "$(formatClientAllowedIPs "0.0.0.0/0,::/0")" "formatClientAllowedIPs adds space after comma"

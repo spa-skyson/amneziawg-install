@@ -10601,35 +10601,42 @@ function boringtunServiceInactive() { # <interface>
 }
 
 # Whether NAME, an entry of AMNEZIAWG_DIR, belongs to the installation of
-# INTERFACE: params and its backup and temporary copies, the interface's
-# config with its backups and the web helper's temporary copies, its BoringTun
-# runtime file, the client configs, retained protocol and imitation
-# transactions, and the web helper's lock and sync files for the interface.
+# INTERFACE. Only the exact names it writes count: params, its backup and
+# mktemp copies; the interface's config, its backup and the web helper's
+# temporary copy; its BoringTun runtime file and that file's temporary copy;
+# the hidden protocol and imitation copies of those three; the client configs;
+# retained protocol and imitation transactions; and the web helper's lock and
+# sync files. Any other name, such as params.conf or <interface>.conf.conf
+# (the configs of interfaces named params or <interface>.conf), is not.
 function awgConfigEntryOwned() { # <name> <interface>
-	case "$1" in
-		params | params.* | clients | .awg-protocol.* | .awg-imitation.* | \
-			"$2.conf" | "$2.conf".* | "$2.boringtun" | ".$2".*)
-			return 0
-			;;
-	esac
-	return 1
+	[[ "$2" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+	# The interface name as a literal in the pattern, and mktemp's XXXXXX.
+	local N="${2//./[.]}" X='[A-Za-z0-9]{6}'
+	local OWNED="^(params([.]bak|[.]${X}|[.]tmp[.]${X})?|clients|[.]awg-(protocol|imitation)[.]${X}"
+	OWNED+="|${N}[.]conf([.]bak|[.]tmp[.]${X})?|${N}[.]boringtun|[.]${N}[.](boringtun[.]${X}|web[.]lock|sync[.]${X})"
+	OWNED+="|[.](params|${N}[.]conf|${N}[.]boringtun)[.](protocol|imitation)[.]${X})\$"
+	[[ "$1" =~ ${OWNED} ]]
 }
 
-# Remove the installation's own entries of AMNEZIAWG_DIR, params last, so that
-# a failure keeps params for a rerun of the uninstall. Anything else there,
-# such as the config of a tunnel set up by hand (issue #158), stays, and so
-# does the directory then. Fails when an own entry could not be removed.
+# Remove the installation's own entries of AMNEZIAWG_DIR. Params and the
+# server config go last, the config first: until every other entry is gone
+# both stay, so that a failed removal leaves an installation the next run
+# loads and uninstalls again. Anything else there, such as the config of a
+# tunnel set up by hand (issue #158), stays, and so does the directory then.
+# Fails when an own entry could not be removed.
 function removeAwgInstallConfig() {
 	local ENTRY NAME LEFT="" KEPT=""
-	local -a OWN=() PARAMS=()
+	local -a OWN=()
 	[[ -e "${AMNEZIAWG_DIR}" || -L "${AMNEZIAWG_DIR}" ]] || return 0
+	if [[ ! "${SERVER_AWG_NIC:-}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+		echo -e "${RED}ERROR: SERVER_AWG_NIC is not a valid interface name; nothing was removed from ${AMNEZIAWG_DIR}.${NC}"
+		return 1
+	fi
 	while IFS= read -r -d '' ENTRY; do
 		NAME="${ENTRY##*/}"
-		if ! awgConfigEntryOwned "${NAME}" "${SERVER_AWG_NIC:?}"; then
+		if ! awgConfigEntryOwned "${NAME}" "${SERVER_AWG_NIC}"; then
 			KEPT+=" ${NAME}"
-		elif [[ "${NAME}" == params || "${NAME}" == params.* ]]; then
-			PARAMS+=("${ENTRY}")
-		else
+		elif [[ "${NAME}" != params && "${NAME}" != "${SERVER_AWG_NIC}.conf" ]]; then
 			OWN+=("${ENTRY}")
 		fi
 	done < <(find "${AMNEZIAWG_DIR}" -mindepth 1 -maxdepth 1 -print0)
@@ -10637,14 +10644,20 @@ function removeAwgInstallConfig() {
 		rm -rf -- "${ENTRY}"
 		[[ ! -e "${ENTRY}" && ! -L "${ENTRY}" ]] || LEFT+=" ${ENTRY##*/}"
 	done
-	if [[ -z "${LEFT}" ]]; then
-		for ENTRY in "${PARAMS[@]}"; do
-			rm -f -- "${ENTRY}"
-			[[ ! -e "${ENTRY}" && ! -L "${ENTRY}" ]] || LEFT+=" ${ENTRY##*/}"
-		done
-	fi
 	if [[ -n "${LEFT}" ]]; then
-		echo -e "${RED}ERROR: could not remove${LEFT} from ${AMNEZIAWG_DIR}.${NC}"
+		echo -e "${RED}ERROR: could not remove${LEFT} from ${AMNEZIAWG_DIR}; params and ${SERVER_AWG_NIC}.conf were kept, so the uninstall can be run again.${NC}"
+		return 1
+	fi
+	ENTRY="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
+	rm -f -- "${ENTRY}"
+	if [[ -e "${ENTRY}" || -L "${ENTRY}" ]]; then
+		echo -e "${RED}ERROR: could not remove ${ENTRY}; params were kept, so the uninstall can be run again.${NC}"
+		return 1
+	fi
+	ENTRY="${AMNEZIAWG_DIR}/params"
+	rm -f -- "${ENTRY}"
+	if [[ -e "${ENTRY}" || -L "${ENTRY}" ]]; then
+		echo -e "${RED}ERROR: could not remove ${ENTRY}, the last file of this installation there; remove it by hand.${NC}"
 		return 1
 	fi
 	if [[ -n "${KEPT}" ]]; then

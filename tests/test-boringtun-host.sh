@@ -1579,6 +1579,22 @@ for UN_BACKEND in boringtun kernel; do
 	assert_contains "awg1.conf, which this installation did not create" "${OUT}" "  and the operator is told"
 	rm -rf "${AMNEZIAWG_DIR}"
 done
+# A client directory that cannot be removed fails either uninstall, but keeps
+# params with the server config, so the next run loads the installation and
+# the rerun finishes.
+for UN_BACKEND in boringtun kernel; do
+	mkdir -p "${AMNEZIAWG_DIR}/clients"
+	: >"${AMNEZIAWG_DIR}/awg0.conf"
+	: >"${AMNEZIAWG_DIR}/clients/awg0-client-alice.conf"
+	: >"${S}/un"
+	RM_FAILS="${AMNEZIAWG_DIR}/clients" OS=ubuntu AWG_BACKEND="${UN_BACKEND}" RUN_INPUT=y run uninstall_flow
+	assert_rc 1 "${RC}" "${UN_BACKEND}: a client directory that cannot be removed fails the uninstall"
+	assert_true "  and keeps params and the server config for a rerun" \
+		test -e "${AMNEZIAWG_DIR}/params" -a -e "${AMNEZIAWG_DIR}/awg0.conf"
+	OS=ubuntu AWG_BACKEND="${UN_BACKEND}" RUN_INPUT=y run uninstall_flow
+	assert_rc 0 "${RC}" "${UN_BACKEND}: the rerun succeeds"
+	assert_true "  and removes the configuration" test ! -e "${AMNEZIAWG_DIR}"
+done
 # S3: a failed package or repository step keeps the configuration.
 for FAILING in PACKAGES_RC PPA_RC; do
 	: >"${S}/un"

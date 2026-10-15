@@ -267,12 +267,13 @@ validate_server_config_path() {
     reject_symlinks "${path}"
 }
 
-# Refuse to change a server config that is not the installer's server: its
-# [Interface] PrivateKey (as awg setconf reads it: key names in any case,
-# whitespace and comments ignored, the last line winning) must be
-# SERVER_PRIV_KEY from params.  A config with another key is a tunnel set up by
-# hand, such as the upstream side of a two-hop server, and a client peer added
-# to it breaks both.  Neither key is printed.
+# Refuse to change an interface, live or in its config, that is not the
+# installer's server: the config's [Interface] PrivateKey (as awg setconf reads
+# it: key names in any case, whitespace and comments ignored, the last line
+# winning) must be SERVER_PRIV_KEY from params.  A config with another key is a
+# tunnel set up by hand, such as the upstream side of a two-hop server, and a
+# peer added to or removed from it breaks both.  Every mutating operation
+# checks this.  Neither key is printed.
 require_managed_server_config() {
     local path="$1"
     local line clean value params_key="" config_key="" in_interface="false"
@@ -809,6 +810,7 @@ reconcile_interface() {
     validate_server_config_path "${path}"
     acquire_server_config_lock "${interface}"
     validate_server_config_path "${path}"
+    require_managed_server_config "${path}"
     require_executable "${AWG_QUICK_BIN}"
     require_executable "${AWG_BIN}"
     require_executable "${MKTEMP_BIN}"
@@ -1026,6 +1028,10 @@ main() {
             require_arg_count "${subcommand}" 2 "$#"
             validate_interface "$1"
             validate_public_key "$2"
+            # A live peer is removed only from the installer's own interface.
+            local peer_path="${AWG_CONFIG_ROOT}/$1.conf"
+            validate_server_config_path "${peer_path}"
+            require_managed_server_config "${peer_path}"
             require_executable "${AWG_BIN}"
             command=("${AWG_BIN}" set "$1" peer "$2" remove)
             ;;

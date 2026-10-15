@@ -2750,12 +2750,34 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 		>/dev/null 2>&1 && HELPER_FOREIGN_FAILED=1
 	"${PRIVILEGED_HELPER}" remove-client-if-key "${HELPER_FOREIGN_INTERFACE}" existing \
 		"${SECOND_HELPER_KEY}" >/dev/null 2>&1 && HELPER_FOREIGN_FAILED=1
+	# Nor does it change that tunnel live: disabling a peer there would cut
+	# the upstream connection.
+	: > /tmp/awg-calls.log
+	: > /tmp/awg-quick-calls.log
+	"${PRIVILEGED_HELPER}" remove-peer "${HELPER_FOREIGN_INTERFACE}" "${SECOND_HELPER_KEY}" \
+		>/dev/null 2>&1 && HELPER_FOREIGN_FAILED=1
+	printf '%s\n' "${SECOND_HELPER_KEY}" | "${PRIVILEGED_HELPER}" reconcile-interface "${HELPER_FOREIGN_INTERFACE}" \
+		>/dev/null 2>&1 && HELPER_FOREIGN_FAILED=1
+	if grep -q "${HELPER_FOREIGN_INTERFACE}" /tmp/awg-calls.log /tmp/awg-quick-calls.log; then
+		HELPER_FOREIGN_FAILED=1
+	fi
 	if [[ "${HELPER_FOREIGN_FAILED}" -eq 0 ]] && \
 		[[ "$(sha256sum "${HELPER_FOREIGN_CONF}" | awk '{print $1}')" == "${HELPER_FOREIGN_HASH}" ]] && \
 		! grep -Fq 'UPSTREAM_PRIVATE_SECRET' <<<"${HELPER_FOREIGN_ERR}"; then
-		echo "OK: Privileged helper refuses to change a config that is not the managed server"
+		echo "OK: Privileged helper refuses to change, in its config or live, an interface that is not the managed server"
 	else
-		echo "FAIL: Privileged helper changed a config that is not the managed server"
+		echo "FAIL: Privileged helper changed an interface that is not the managed server"
+		FAILED=$((FAILED + 1))
+	fi
+	# The managed interface still takes both live operations.
+	: > /tmp/awg-calls.log
+	if "${PRIVILEGED_HELPER}" remove-peer awg0 "${SECOND_HELPER_KEY}" >/dev/null 2>&1 && \
+		grep -qx "set awg0 peer ${SECOND_HELPER_KEY} remove" /tmp/awg-calls.log && \
+		printf '' | "${PRIVILEGED_HELPER}" reconcile-interface awg0 >/dev/null 2>&1 && \
+		grep -q '^syncconf awg0 ' /tmp/awg-calls.log; then
+		echo "OK: Privileged helper still removes peers from and reconciles the managed interface"
+	else
+		echo "FAIL: Privileged helper refused a live operation on the managed interface"
 		FAILED=$((FAILED + 1))
 	fi
 	rm -f "${HELPER_FOREIGN_CONF}" "/etc/amnezia/amneziawg/.${HELPER_FOREIGN_INTERFACE}.web.lock"
