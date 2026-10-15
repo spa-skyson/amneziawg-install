@@ -267,6 +267,44 @@ validate_server_config_path() {
     reject_symlinks "${path}"
 }
 
+# Refuse to change a server config that is not the installer's server: its
+# [Interface] PrivateKey (as awg setconf reads it: key names in any case,
+# whitespace and comments ignored, the last line winning) must be
+# SERVER_PRIV_KEY from params.  A config with another key is a tunnel set up by
+# hand, such as the upstream side of a two-hop server, and a client peer added
+# to it breaks both.  Neither key is printed.
+require_managed_server_config() {
+    local path="$1"
+    local line clean value params_key="" config_key="" in_interface="false"
+
+    reject_symlinks "${AWG_PARAMS_PATH}"
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        if [[ "${line}" =~ ^[[:blank:]]*SERVER_PRIV_KEY=(.*)$ ]]; then
+            value="${BASH_REMATCH[1]}"
+            if (( ${#value} >= 2 )) && { \
+                    [[ "${value}" == \'*\' ]] || [[ "${value}" == \"*\" ]]; }; then
+                value="${value:1:${#value}-2}"
+            fi
+            params_key="${value}"
+        fi
+    done < "${AWG_PARAMS_PATH}"
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        clean="${line%%#*}"
+        clean="${clean//[[:space:]]/}"
+        if [[ "${clean}" == "["*"]" ]]; then
+            in_interface="false"
+            [[ "${clean,,}" == "[interface]" ]] && in_interface="true"
+        elif [[ "${in_interface}" == "true" && "${clean,,}" == privatekey=* ]]; then
+            config_key="${clean#*=}"
+        fi
+    done < "${path}"
+
+    if [[ -z "${config_key}" || "${config_key}" != "${params_key}" ]]; then
+        fail "${path} is not the installer-managed server: its [Interface] PrivateKey is not SERVER_PRIV_KEY from ${AWG_PARAMS_PATH}; check SERVER_AWG_NIC in params"
+    fi
+}
+
 acquire_server_config_lock() {
     local interface="$1"
     local lock_path="${AWG_CONFIG_ROOT}/.${interface}.web.lock"
@@ -1043,6 +1081,7 @@ main() {
             validate_server_config_path "${append_path}"
             acquire_server_config_lock "$1"
             validate_server_config_path "${append_path}"
+            require_managed_server_config "${append_path}"
             append_peer_block "${append_path}" "$2" \
                 "${PEER_PUBLIC_KEY}" "${PEER_PRESHARED_KEY}" "${PEER_ALLOWED_IPS}"
             return 0
@@ -1055,6 +1094,7 @@ main() {
             validate_server_config_path "${remove_path}"
             acquire_server_config_lock "$1"
             validate_server_config_path "${remove_path}"
+            require_managed_server_config "${remove_path}"
             remove_client_block "${remove_path}" "$2"
             return 0
             ;;
@@ -1067,6 +1107,7 @@ main() {
             validate_server_config_path "${conditional_remove_path}"
             acquire_server_config_lock "$1"
             validate_server_config_path "${conditional_remove_path}"
+            require_managed_server_config "${conditional_remove_path}"
             remove_client_block "${conditional_remove_path}" "$2" "$3"
             return 0
             ;;

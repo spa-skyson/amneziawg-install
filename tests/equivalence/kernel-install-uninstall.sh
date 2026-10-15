@@ -74,10 +74,12 @@ exit 0
 EOF
 chmod 0755 "${M}/awg"
 mock awg-quick '[[ "$1" == strip ]] && printf "[Interface]\nListenPort = 51820\n"; exit 0'
+# An AmneziaWG link exists once its config does; a fresh install refuses one.
 mock ip '
 case "$1$2" in
 	-4route) echo "default via 198.51.100.254 dev eth0" ;;
 	-6route) echo "default via 2001:db8::ffff dev eth0" ;;
+	linkshow) [[ -e "/etc/amnezia/amneziawg/${4:-}.conf" ]]; exit ;;
 esac
 exit 0'
 mock modprobe 'exit 0'

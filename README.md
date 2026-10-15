@@ -386,7 +386,7 @@ Override specific defaults with environment variables:
 |----------|---------|
 | `SERVER_PUB_IP` | Auto-detected |
 | `SERVER_PUB_NIC` | Auto-detected |
-| `SERVER_AWG_NIC` | `awg0` |
+| `SERVER_AWG_NIC` | `awg0`, or the first free `awgN` when `awg0` is in use |
 | `SERVER_AWG_IPV4` | `10.66.66.1` |
 | `SERVER_AWG_IPV6` | `fd42:42:42::1` |
 | `ENABLE_IPV6` | `y` if the host has IPv6, otherwise `n` |
@@ -400,6 +400,16 @@ Override specific defaults with environment variables:
 Set `ENABLE_IPV6=n` for an IPv4-only deployment: the server interface, firewall
 rules, and all generated client configs omit IPv6 (no IPv6 address, no `::/0`
 route), which avoids route-setup errors on hosts where IPv6 is disabled.
+
+The installer manages one AmneziaWG interface per host and never takes over
+one that already exists, such as the upstream tunnel of a two-hop server. An
+interface name is in use when `/etc/amnezia/amneziawg/<name>.conf` or a network
+link of that name exists. An explicit `SERVER_AWG_NIC` that is in use stops the
+installation before anything is installed; without one, the installer picks
+the first free `awgN` and says so. Later, every management action (adding,
+removing or regenerating clients, protocol changes, the web panel) refuses to
+change the config named by `SERVER_AWG_NIC` in params unless its
+`[Interface] PrivateKey` is the installation's `SERVER_PRIV_KEY`.
 
 Example:
 
