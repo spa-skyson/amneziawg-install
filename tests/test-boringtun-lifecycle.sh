@@ -294,12 +294,20 @@ _probe_stub() { # <label> <key>
 probeAwg3Capability() { _probe_stub 3 "${1:-}"; }
 probeAwg31Capability() { _probe_stub 31 "${1:-}"; }
 validateStagedAwgConfigs() {
-	local WORK_DIR="$1" FILE NAMES=""
+	local WORK_DIR="$1" NAMES="" LABELS=""
 	shift
-	for FILE in "$@"; do
-		NAMES+="${FILE##*/} "
+	# A file may be preceded by --label <description>, the words a rejection
+	# names it by; log both so the lifecycle checks are told what it validated.
+	while (($# > 0)); do
+		if [[ "$1" == --label ]]; then
+			LABELS+="${2}; "
+			shift 2
+			continue
+		fi
+		NAMES+="${1##*/} "
+		shift
 	done
-	echo "validate candidate=${_AWG_BT_CANDIDATE_RELEASE} current=$(readlink "${STORE}/current") imitation=${AWG_BORINGTUN_IMITATE_PROTOCOL}|${AWG_BORINGTUN_IMITATE_DOMAIN} files=${NAMES% }" >>"${S}/log"
+	echo "validate candidate=${_AWG_BT_CANDIDATE_RELEASE} current=$(readlink "${STORE}/current") imitation=${AWG_BORINGTUN_IMITATE_PROTOCOL}|${AWG_BORINGTUN_IMITATE_DOMAIN} files=${NAMES% } labels=${LABELS%; }" >>"${S}/log"
 	[[ -f "${S}/validate-term" ]] && { rm -f "${S}/validate-term"; kill -TERM "${BASHPID}"; }
 	[[ -f "${S}/validate-touch" ]] && echo "# changed during the validation" >>"${AMNEZIAWG_DIR}/clients/awg0-client-bob.conf"
 	! grep -qxF -- "${_AWG_BT_CANDIDATE_RELEASE}" "${S}/reject-validate" 2>/dev/null
@@ -711,6 +719,8 @@ for SETTING in "none||2" "dns|example.com|2" "dns|example.com|3" "dns|example.co
 	assert_rc 0 "${RC}" "${LABEL}: the upgrade succeeds"
 	assert_contains "validate candidate=${STORE_ID_[new]} current=${STORE_ID_[old]} imitation=${P}|${D} files=awg0.conf client-1.conf client-2.conf" "${LOG}" \
 		"${LABEL}: the new binary validated the server and both client configs with the persisted imitation while current was still the old release"
+	assert_contains "labels=the server configuration (${AMNEZIAWG_DIR}/awg0.conf); client 1 'alice' (${AMNEZIAWG_DIR}/clients/awg0-client-alice.conf); client 2 'bob' (${AMNEZIAWG_DIR}/clients/awg0-client-bob.conf)" "${LOG}" \
+		"${LABEL}: naming the server configuration and each client by name for a rejection, not the private copies"
 	case "${V}" in
 		2) assert_not_contains "probe" "${LOG}" "${LABEL}: no AWG 3.x probe" ;;
 		3) assert_contains "probe3 candidate=${STORE_ID_[new]} current=${STORE_ID_[old]} key=persisted" "${LOG}" "${LABEL}: the AWG 3.0 probe ran on the new binary with the persisted key" ;;

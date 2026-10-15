@@ -2248,14 +2248,53 @@ function awgBackendValidationText() {
 	esac
 }
 
+# Tool diagnostics quote the offending configuration line, and the files the
+# probe and the staged validation hand to awg carry keys. Redact anything
+# shaped like a base64 key (43 characters and "=") and withhold whole lines
+# that name a private, preshared or header-protection key, or that awg prints
+# for a malformed key, since those quote the raw value.
+function redactAwgKeyMaterial() {
+	local LINE KEY_PATTERN='[A-Za-z0-9+/]{43}='
+	while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
+		case "${LINE,,}" in
+			*headerprotectionkey*) LINE="(a line naming HeaderProtectionKey was withheld)" ;;
+			*presharedkey*) LINE="(a line naming PresharedKey was withheld)" ;;
+			*privatekey*) LINE="(a line naming PrivateKey was withheld)" ;;
+			*"key is not the correct length"*) LINE="(a line quoting a malformed key was withheld)" ;;
+		esac
+		while [[ "${LINE}" =~ ${KEY_PATTERN} ]]; do
+			LINE="${LINE/"${BASH_REMATCH[0]}"/[redacted key]}"
+		done
+		printf '%s\n' "${LINE}"
+	done
+}
+
+# Report one failed probe or validation step: HEADLINE names the step and the
+# file, and the tool's own stderr, captured in STDERR_FILE, follows indented
+# with key material redacted. The caller's generic verdict stays the last line.
+function reportAwgToolFailure() { # <headline> <captured stderr file>
+	local HEADLINE="$1" STDERR_FILE="$2" LINE PRINTED=0
+	echo "ERROR: ${HEADLINE}:" >&2
+	if [[ -s "${STDERR_FILE}" ]]; then
+		while IFS= read -r LINE; do
+			[[ -n "${LINE//[[:space:]]/}" ]] || continue
+			echo "       ${LINE}" >&2
+			PRINTED=1
+		done < <(redactAwgKeyMaterial <"${STDERR_FILE}")
+	fi
+	(( PRINTED )) || echo "       (the tool printed no message)" >&2
+}
+
 # Exercise the complete userspace -> generic-netlink -> running-kernel path.
 # Version strings are intentionally ignored: distributions can ship a new awg
 # binary alongside an older loaded module (or the reverse). The probe succeeds
 # only when every required protocol field can be applied and read back unchanged.
+# When awg setconf rejects the probe configuration, its own message is relayed
+# (keys redacted) before the verdict, so the operator sees which field it refused.
 function probeAwgProtocolCapability() {
 	local REQUIRE_31="${1:-0}"
 	local PROBE_KEY="${2:-}"
-	local PROBE_DIR PROBE_CONF PROBE_INTERFACE PROBE_EXTRA=""
+	local PROBE_DIR PROBE_CONF PROBE_STDERR PROBE_INTERFACE PROBE_EXTRA=""
 	local READ_KEY READ_CONTENT READ_REKEY_AFTER READ_REKEY_TIMEOUT
 	local READ_REJECT READ_KEEPALIVE READ_TRAILERS READ_COOKIES
 	local RC=1 INTERFACE_CREATED=0
@@ -2282,6 +2321,7 @@ function probeAwgProtocolCapability() {
 	}
 	chmod 700 "${PROBE_DIR}"
 	PROBE_CONF="${PROBE_DIR}/probe.conf"
+	PROBE_STDERR="${PROBE_DIR}/setconf.stderr"
 	PROBE_INTERFACE="awgp$((BASHPID % 100000000))"
 	if (( REQUIRE_31 )); then
 		PROBE_EXTRA="RandomTrailers = on
@@ -2309,7 +2349,7 @@ EOF
 
 	if [[ -s "${PROBE_CONF}" ]] && awgBackendCreateScratchInterface "${PROBE_INTERFACE}" >/dev/null 2>&1; then
 		INTERFACE_CREATED=1
-		if awg setconf "${PROBE_INTERFACE}" "${PROBE_CONF}" >/dev/null 2>&1; then
+		if awg setconf "${PROBE_INTERFACE}" "${PROBE_CONF}" >/dev/null 2>"${PROBE_STDERR}"; then
 			READ_KEY="$(WG_HIDE_KEYS=never awg show "${PROBE_INTERFACE}" header-protection-key 2>/dev/null || true)"
 			READ_CONTENT="$(awg show "${PROBE_INTERFACE}" content-padding-addition 2>/dev/null || true)"
 			READ_REKEY_AFTER="$(awg show "${PROBE_INTERFACE}" rekey-after-time 2>/dev/null || true)"
@@ -2335,6 +2375,7 @@ EOF
 				fi
 			fi
 		else
+			reportAwgToolFailure "awg setconf rejected the ${PROBE_LABEL} probe configuration" "${PROBE_STDERR}"
 			if (( REQUIRE_31 )); then
 				FAIL_DETAIL="$(awgBackendValidationText setconf31)"
 			else
@@ -2348,7 +2389,7 @@ EOF
 	if (( INTERFACE_CREATED )); then
 		awgBackendDestroyScratchInterface "${PROBE_INTERFACE}" >/dev/null 2>&1 || RC=1
 	fi
-	rm -f -- "${PROBE_CONF}"
+	rm -f -- "${PROBE_CONF}" "${PROBE_STDERR}"
 	rmdir -- "${PROBE_DIR}" 2>/dev/null || true
 
 	if (( RC != 0 )); then
@@ -11461,16 +11502,44 @@ function awgProtocolConfigsMatchPersistedState() {
 	return 0
 }
 
+# "client N 'name' (path)": how a validation failure names the Nth active
+# client config, whose file is <nic>-client-<name>.conf, rather than the
+# anonymous staged copy that is deleted together with the transaction.
+function describeAwgClientConfig() { # <ordinal> <client config path>
+	local NAME="${2##*/}"
+	NAME="${NAME#"${SERVER_AWG_NIC}-client-"}"
+	NAME="${NAME%.conf}"
+	printf "client %s '%s' (%s)\n" "$1" "${NAME}" "$2"
+}
+
 # Validate the interface section of every staged config with both awg-quick and
 # the running module. Peer/address data is unchanged by this migration; limiting
 # setconf to [Interface] also avoids DNS resolution for hostname endpoints.
-function validateStagedAwgConfigs() {
+# A config may be preceded by --label <description>, the words a rejection
+# names it by (the server configuration, or a client as describeAwgClientConfig
+# puts it); without one it is named by its path. The step that failed, the file
+# it failed on and the tool's own message (keys redacted) are printed before the
+# generic verdict, which stays the final line.
+function validateStagedAwgConfigs() { # <work dir> [--label <description>] <config file> ...
 	local WORK_DIR="$1"
 	shift
-	local -a CONFIG_FILES=("$@")
+	local -a CONFIG_FILES=() CONFIG_LABELS=()
 	local VALIDATE_INTERFACE="awgv$((BASHPID % 100000000))"
-	local CONFIG_FILE STRIPPED_FILE INTERFACE_FILE LINE CLEAN PORT
-	local INDEX=0 RC=0 INTERFACE_CREATED=0 PORTS
+	local STDERR_FILE="${WORK_DIR}/validate.stderr"
+	local CONFIG_FILE CONFIG_LABEL STRIPPED_FILE INTERFACE_FILE LINE CLEAN PORT
+	local INDEX=0 RC=0 INTERFACE_CREATED=0 PORTS LABEL=""
+
+	while (($# > 0)); do
+		if [[ "$1" == --label && $# -ge 2 ]]; then
+			LABEL="$2"
+			shift 2
+			continue
+		fi
+		CONFIG_FILES+=("$1")
+		CONFIG_LABELS+=("${LABEL:-$1}")
+		LABEL=""
+		shift
+	done
 
 	if ! awgBackendCreateScratchInterface "${VALIDATE_INTERFACE}" >/dev/null 2>&1; then
 		echo "ERROR: could not create the temporary AWG configuration-validation interface" >&2
@@ -11479,10 +11548,12 @@ function validateStagedAwgConfigs() {
 	INTERFACE_CREATED=1
 
 	for CONFIG_FILE in "${CONFIG_FILES[@]}"; do
+		CONFIG_LABEL="${CONFIG_LABELS[${INDEX}]}"
 		INDEX=$((INDEX + 1))
 		STRIPPED_FILE="${WORK_DIR}/validate-${INDEX}.stripped"
 		INTERFACE_FILE="${WORK_DIR}/validate-${INDEX}.interface"
-		if ! awg-quick strip "${CONFIG_FILE}" >"${STRIPPED_FILE}" 2>/dev/null; then
+		if ! awg-quick strip "${CONFIG_FILE}" >"${STRIPPED_FILE}" 2>"${STDERR_FILE}"; then
+			reportAwgToolFailure "awg-quick strip rejected ${CONFIG_LABEL}" "${STDERR_FILE}"
 			RC=1
 			break
 		fi
@@ -11506,7 +11577,7 @@ function validateStagedAwgConfigs() {
 					PORTS=$((PORTS + 1))
 					PORT="${CLEAN#*=}"
 					if ((PORTS > 1)) || ! [[ "${PORT}" =~ ^[1-9][0-9]{0,4}$ ]] || ((10#${PORT} > 65535)); then
-						echo "ERROR: ${CONFIG_FILE} must set ListenPort at most once, to a port number from 1 to 65535" >&2
+						echo "ERROR: ${CONFIG_LABEL} must set ListenPort at most once, to a port number from 1 to 65535" >&2
 						RC=1
 						break
 					fi
@@ -11516,15 +11587,18 @@ function validateStagedAwgConfigs() {
 			printf '%s\n' "${LINE}" >>"${INTERFACE_FILE}"
 		done <"${STRIPPED_FILE}"
 		((RC == 0)) || break
-		if ! awg setconf "${VALIDATE_INTERFACE}" "${INTERFACE_FILE}" >/dev/null 2>&1; then
+		if ! awg setconf "${VALIDATE_INTERFACE}" "${INTERFACE_FILE}" >/dev/null 2>"${STDERR_FILE}"; then
+			reportAwgToolFailure "awg setconf rejected ${CONFIG_LABEL}" "${STDERR_FILE}"
 			RC=1
 			break
 		fi
 	done
 
-	if (( INTERFACE_CREATED )) && ! awgBackendDestroyScratchInterface "${VALIDATE_INTERFACE}" >/dev/null 2>&1; then
+	if (( INTERFACE_CREATED )) && ! awgBackendDestroyScratchInterface "${VALIDATE_INTERFACE}" >/dev/null 2>"${STDERR_FILE}"; then
+		reportAwgToolFailure "could not delete the temporary AWG configuration-validation interface ${VALIDATE_INTERFACE}" "${STDERR_FILE}"
 		RC=1
 	fi
+	rm -f -- "${STDERR_FILE}"
 	if (( RC != 0 )); then
 		echo "ERROR: $(awgBackendValidationText staged)" >&2
 		return 1
@@ -11664,7 +11738,10 @@ function applyAwgProtocolTransaction() (
 		return 1
 	fi
 	chmod 600 "${FIELDS_FILE}" "${SERVER_BACKUP}" "${PARAMS_BACKUP}" "${SERVER_STAGE}" "${PARAMS_STAGE}"
-	VALIDATION_FILES+=("${SERVER_STAGE}")
+	# Validation names each staged copy after the file it was made from: the
+	# stage files are gone with the transaction directory by the time an
+	# operator reads a rejection.
+	VALIDATION_FILES+=(--label "the server configuration (${SERVER_AWG_CONF})" "${SERVER_STAGE}")
 
 	for INDEX in "${!CLIENT_PATHS[@]}"; do
 		CLIENT_PATH="${CLIENT_PATHS[${INDEX}]}"
@@ -11677,7 +11754,7 @@ function applyAwgProtocolTransaction() (
 		fi
 		chown --reference="${CLIENT_PATH}" "${CLIENT_STAGES[${INDEX}]}" 2>/dev/null || true
 		chmod 600 "${CLIENT_STAGES[${INDEX}]}" "${CLIENT_BACKUPS[${INDEX}]}"
-		VALIDATION_FILES+=("${CLIENT_STAGES[${INDEX}]}")
+		VALIDATION_FILES+=(--label "$(describeAwgClientConfig "$((INDEX + 1))" "${CLIENT_PATH}")" "${CLIENT_STAGES[${INDEX}]}")
 	done
 
 	if ! validateStagedAwgConfigs "${TRANSACTION_DIR}" "${VALIDATION_FILES[@]}"; then
@@ -12498,7 +12575,7 @@ function _awgBtReconcileLifecycleHelpers() {
 # awg-quick strip accepts their names). Nothing is rewritten.
 function _awgBtValidateReleaseCandidate() { # <release id> <private work dir>
 	local RELEASE="$1" WORK="$2" RC=0 INDEX=0 CLIENT
-	local -a CLIENTS=() FILES=("${SERVER_AWG_CONF}")
+	local -a CLIENTS=() FILES=(--label "the server configuration (${SERVER_AWG_CONF})" "${SERVER_AWG_CONF}")
 	_AWG_BT_CANDIDATE_RELEASE="${RELEASE}"
 	case "${AWG_PROTOCOL_VERSION}" in
 		"${AWG_PROTOCOL_VERSION_3}") probeAwg3Capability "${AWG_HEADER_PROTECTION_KEY}" || RC=1 ;;
@@ -12514,7 +12591,7 @@ function _awgBtValidateReleaseCandidate() { # <release id> <private work dir>
 				RC=1
 				break
 			fi
-			FILES+=("${WORK}/client-${INDEX}.conf")
+			FILES+=(--label "$(describeAwgClientConfig "${INDEX}" "${CLIENT}")" "${WORK}/client-${INDEX}.conf")
 		done
 	fi
 	if ((RC == 0)) && ! validateStagedAwgConfigs "${WORK}" "${FILES[@]}"; then
