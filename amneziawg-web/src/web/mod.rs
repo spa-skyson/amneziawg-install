@@ -4266,10 +4266,12 @@ fn html_head(title: &str) -> String {
   .edit-form textarea {{ resize: vertical; min-height: 4rem; }}
   .edit-form button[type=submit] {{ margin-top: 1rem; padding: .4rem 1.1rem; background: #0066cc; color: #fff; border: none; border-radius: 3px; cursor: pointer; font-size: .95rem; }}
   .edit-form button[type=submit]:hover {{ background: #0055aa; }}
-  .nav {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; padding-bottom: .5rem; border-bottom: 1px solid #ddd; }}
-  .nav-brand {{ display: flex; flex-wrap: wrap; gap: .35rem .8rem; align-items: baseline; }}
-  .versions {{ font-size: .78rem; color: #666; }}
-  .nav-logout {{ display: inline-block; }}
+  .nav {{ display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: .75rem 1rem; margin-bottom: 1.5rem; padding-bottom: .75rem; border-bottom: 1px solid #ddd; }}
+  .nav-brand {{ display: flex; flex-direction: column; gap: .2rem; min-width: 0; }}
+  .nav-title {{ color: inherit; font-size: 1.375rem; font-weight: 700; line-height: 1.2; overflow-wrap: anywhere; }}
+  .nav-byline {{ font-size: .8rem; color: #666; }}
+  .versions {{ grid-column: 1 / -1; min-width: 0; font-size: .78rem; line-height: 1.5; color: #666; overflow-wrap: anywhere; }}
+  .nav-logout {{ margin: 0; white-space: nowrap; }}
   .nav-logout button {{ padding: .3rem .8rem; background: #e55; color: #fff; border: none; border-radius: 3px; cursor: pointer; font-size: .85rem; }}
   .nav-logout button:hover {{ background: #c33; }}
   .error {{ color: #c00; margin-top: .5rem; font-size: .95rem; }}
@@ -4296,11 +4298,15 @@ fn html_head(title: &str) -> String {
 fn nav_bar(csrf_token: &str) -> String {
     format!(
         r#"<nav class="nav">
-  <span class="nav-brand"><a href="/">AmneziaWG Panel</a><span id="system-versions" class="versions">Protocol: checking &nbsp;·&nbsp; Backend: checking &nbsp;·&nbsp; Panel: {web_version}</span></span>
+  <div class="nav-brand">
+    <a class="nav-title" href="/">AmneziaWG Server Tools</a>
+    <span class="nav-byline">by <a href="https://www.wiresock.net/" target="_blank" rel="noopener noreferrer" aria-label="WireSock website (opens in a new tab)">WireSock <span aria-hidden="true">↗</span></a></span>
+  </div>
   <form class="nav-logout" method="POST" action="/logout">
     <input type="hidden" name="csrf_token" value="{csrf}">
     <button type="submit">Log out</button>
   </form>
+  <div id="system-versions" class="versions">Protocol: checking &nbsp;·&nbsp; Backend: checking &nbsp;·&nbsp; Panel: {web_version}</div>
 </nav>
 <script>
 (function() {{
@@ -4558,7 +4564,7 @@ fn render_peer_list_inner(
     let mut buf = html_head("AmneziaWG – Peers");
     let now = Utc::now();
     buf.push_str(&nav_bar(csrf_token));
-    buf.push_str("<h1>AmneziaWG Peers</h1>\n");
+    buf.push_str("<h1>Peers</h1>\n");
     buf.push_str(&render_system_status(system_status));
     let archive_toggle = if show_archived {
         r#"<a href="/">Hide archived keys</a>"#

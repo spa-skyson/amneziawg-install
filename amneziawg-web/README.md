@@ -5,6 +5,11 @@ A self-hosted web panel for **visibility and management** of
 installations managed via the
 [amneziawg-install](https://github.com/wiresock/amneziawg-install) script.
 
+The panel header identifies the product as **AmneziaWG Server Tools** by
+[WireSock](https://www.wiresock.net/). The product name returns to **Peers**;
+the WireSock link opens in a new tab. Protocol, backend, and component versions
+appear on a separate status row beneath the branding.
+
 > **Status: v0.1.0** – feature-complete for private self-hosted deployment.
 > Suitable for single-admin home or corporate VPN monitoring behind a reverse proxy.
 
