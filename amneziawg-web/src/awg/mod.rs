@@ -349,6 +349,91 @@ pub fn set_protocol_mode_via_sudo(operation: &str) -> Result<(), AwgError> {
     Ok(())
 }
 
+/// Prefix the privileged helper puts before each installer line it relays
+/// after a failed protocol migration.
+pub const INSTALLER_DIAGNOSTIC_PREFIX: &str = "installer: ";
+/// Upper bound on relayed lines kept, matching the helper's own limit.
+pub const MAX_INSTALLER_DIAGNOSTIC_LINES: usize = 12;
+/// Upper bound on characters kept per relayed line.
+pub const MAX_INSTALLER_DIAGNOSTIC_WIDTH: usize = 256;
+
+/// Extract the installer diagnostics the privileged helper relayed on a failed
+/// protocol migration from the helper's stderr. Only lines carrying the
+/// helper's prefix count; its own failure line and anything sudo prints are
+/// left out. Control characters are replaced and each line is bounded, so the
+/// result is safe to render once HTML-escaped. The helper already stripped
+/// terminal escapes and withheld key material.
+pub fn installer_diagnostics(stderr: &str) -> Vec<String> {
+    let mut lines: Vec<String> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix(INSTALLER_DIAGNOSTIC_PREFIX))
+        .map(|line| {
+            line.chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect::<String>()
+                .trim()
+                .chars()
+                .take(MAX_INSTALLER_DIAGNOSTIC_WIDTH)
+                .collect::<String>()
+        })
+        .filter(|line| !line.is_empty())
+        .collect();
+    let excess = lines.len().saturating_sub(MAX_INSTALLER_DIAGNOSTIC_LINES);
+    if excess > 0 {
+        lines.drain(..excess);
+    }
+    lines
+}
+
+#[cfg(test)]
+mod installer_diagnostics_tests {
+    use super::*;
+
+    #[test]
+    fn keeps_only_prefixed_lines() {
+        let stderr = "amneziawg-web-privileged: protocol migration failed\n\
+                      installer: awg setconf rejected the server configuration\n\
+                      sudo: a password is required\n\
+                      installer: ERROR: a staged protocol configuration was rejected\n";
+        assert_eq!(
+            installer_diagnostics(stderr),
+            vec![
+                "awg setconf rejected the server configuration".to_string(),
+                "ERROR: a staged protocol configuration was rejected".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn bounds_lines_and_width_and_replaces_control_characters() {
+        let mut stderr = String::new();
+        for index in 0..20 {
+            stderr.push_str(&format!("installer: line {index}\n"));
+        }
+        stderr.push_str(&format!(
+            "installer: \u{1b}[31mred\u{1b}[0m\ttab{}\n",
+            "x".repeat(400)
+        ));
+        stderr.push_str("installer:    \n");
+        let lines = installer_diagnostics(&stderr);
+        assert_eq!(lines.len(), MAX_INSTALLER_DIAGNOSTIC_LINES);
+        assert_eq!(lines[0], "line 9");
+        let last = lines.last().unwrap();
+        assert!(!last.contains('\u{1b}') && !last.contains('\t'), "{last}");
+        assert!(last.starts_with("[31mred [0m tabx"), "{last}");
+        assert_eq!(last.chars().count(), MAX_INSTALLER_DIAGNOSTIC_WIDTH);
+    }
+
+    #[test]
+    fn empty_without_relayed_lines() {
+        assert!(
+            installer_diagnostics("amneziawg-web-privileged: protocol migration failed\n")
+                .is_empty()
+        );
+        assert!(installer_diagnostics("").is_empty());
+    }
+}
+
 fn imitation_command(settings: &crate::imitation::Settings) -> Result<Command, AwgError> {
     crate::imitation::Settings::parse(&settings.protocol, &settings.domain)
         .map_err(|error| AwgError::Parse(error.into()))?;

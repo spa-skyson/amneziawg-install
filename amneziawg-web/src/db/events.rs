@@ -24,6 +24,8 @@
 //! | [`EVT_LOGIN_SUCCESS`] | `"login_success"` | successful POST /login |
 //! | [`EVT_LOGIN_FAILED`]  | `"login_failed"`  | failed POST /login credential check |
 //! | [`EVT_LOGOUT`]        | `"logout"`        | POST /logout |
+//! | [`EVT_AWG_PROTOCOL_CHANGED`] | `"awg_protocol_changed"` | a confirmed protocol migration succeeded |
+//! | [`EVT_AWG_PROTOCOL_CHANGE_FAILED`] | `"awg_protocol_change_failed"` | a confirmed protocol migration failed; detail holds the sanitized installer output |
 //!
 //! # Fire-and-forget logging
 //!
@@ -64,6 +66,9 @@ pub const EVT_USER_REMOVED: &str = "user_removed";
 pub const EVT_USER_REMOVE_FAILED: &str = "user_remove_failed";
 /// Audit event for a completed AWG 2.0/3.0 interface migration.
 pub const EVT_AWG_PROTOCOL_CHANGED: &str = "awg_protocol_changed";
+/// Audit event for a confirmed AWG interface migration that failed; the detail
+/// JSON carries the operation and the sanitized installer diagnostics.
+pub const EVT_AWG_PROTOCOL_CHANGE_FAILED: &str = "awg_protocol_change_failed";
 /// Successful application, including an idempotent reapplication of settings.
 pub const EVT_IMITATION_APPLIED: &str = "imitation_applied";
 

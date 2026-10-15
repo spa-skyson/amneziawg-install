@@ -85,6 +85,11 @@ AWG_INSTALLER_CAPABILITY_WEB_BORINGTUN="web-boringtun-v1"
 # refuses the value. Later installer versions must keep the line unchanged.
 # shellcheck disable=SC2034
 AWG_INSTALLER_CAPABILITY_BORINGTUN_IMITATION_AUTO="boringtun-imitation-auto-v1"
+# The panel reads this marker before opening FD 3 for vetted protocol failure
+# diagnostics. Raw stdout/stderr (especially awg-quick hooks) are never part
+# of that channel. Keep the marker unchanged for compatible installers.
+# shellcheck disable=SC2034
+AWG_INSTALLER_CAPABILITY_PROTOCOL_DIAGNOSTICS="protocol-diagnostics-v1"
 
 # The immutable public BoringTun release that fresh BoringTun installs download.
 # These values are the installer's only trust anchor for the binary: they are
@@ -2269,20 +2274,31 @@ function redactAwgKeyMaterial() {
 	done
 }
 
+# Keep CLI diagnostics on stderr and opt into the panel's separate channel.
+function reportAwgProtocolDiagnostic() {
+	printf '%s\n' "$1" >&2
+	if [[ "${AWG_INSTALLER_PROTOCOL_DIAGNOSTICS:-}" == 1 ]]; then
+		# This opt-in channel is provided by the privileged panel helper. Only
+		# authored failure context and redacted validation/probe output belong
+		# here; callers must never feed it arbitrary command or hook output.
+		{ printf '%s\n' "$1" >&3; } 2>/dev/null || true
+	fi
+}
+
 # Report one failed probe or validation step: HEADLINE names the step and the
 # file, and the tool's own stderr, captured in STDERR_FILE, follows indented
 # with key material redacted. The caller's generic verdict stays the last line.
 function reportAwgToolFailure() { # <headline> <captured stderr file>
 	local HEADLINE="$1" STDERR_FILE="$2" LINE PRINTED=0
-	echo "ERROR: ${HEADLINE}:" >&2
+	reportAwgProtocolDiagnostic "ERROR: ${HEADLINE}:"
 	if [[ -s "${STDERR_FILE}" ]]; then
 		while IFS= read -r LINE; do
 			[[ -n "${LINE//[[:space:]]/}" ]] || continue
-			echo "       ${LINE}" >&2
+			reportAwgProtocolDiagnostic "       ${LINE}"
 			PRINTED=1
 		done < <(redactAwgKeyMaterial <"${STDERR_FILE}")
 	fi
-	(( PRINTED )) || echo "       (the tool printed no message)" >&2
+	(( PRINTED )) || reportAwgProtocolDiagnostic "       (the tool printed no message)"
 }
 
 # Exercise the complete userspace -> generic-netlink -> running-kernel path.
@@ -2304,19 +2320,19 @@ function probeAwgProtocolCapability() {
 	(( REQUIRE_31 )) && PROBE_LABEL="AWG 3.1"
 
 	if [[ -z "${PROBE_KEY}" ]]; then
-		PROBE_KEY="$(awg genkey 2>/dev/null)" || PROBE_KEY=""
+		PROBE_KEY="$(awg genkey 3>&- 2>/dev/null)" || PROBE_KEY=""
 	fi
 	if ! [[ "${PROBE_KEY}" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
-		echo "ERROR: the installed awg tool could not generate an ${PROBE_LABEL} probe key" >&2
+		reportAwgProtocolDiagnostic "ERROR: the installed awg tool could not generate an ${PROBE_LABEL} probe key"
 		return 1
 	fi
 	if ! command -v ip >/dev/null 2>&1 || ! command -v awg >/dev/null 2>&1; then
-		echo "ERROR: ${PROBE_LABEL} capability probing requires both ip and awg" >&2
+		reportAwgProtocolDiagnostic "ERROR: ${PROBE_LABEL} capability probing requires both ip and awg"
 		return 1
 	fi
 
 	PROBE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/awg3-probe.XXXXXX")" || {
-		echo "ERROR: could not create the private ${PROBE_LABEL} probe directory" >&2
+		reportAwgProtocolDiagnostic "ERROR: could not create the private ${PROBE_LABEL} probe directory"
 		return 1
 	}
 	chmod 700 "${PROBE_DIR}"
@@ -2347,15 +2363,15 @@ ${PROBE_EXTRA}
 EOF
 	) || RC=1
 
-	if [[ -s "${PROBE_CONF}" ]] && awgBackendCreateScratchInterface "${PROBE_INTERFACE}" >/dev/null 2>&1; then
+	if [[ -s "${PROBE_CONF}" ]] && awgBackendCreateScratchInterface "${PROBE_INTERFACE}" 3>&- >/dev/null 2>&1; then
 		INTERFACE_CREATED=1
-		if awg setconf "${PROBE_INTERFACE}" "${PROBE_CONF}" >/dev/null 2>"${PROBE_STDERR}"; then
-			READ_KEY="$(WG_HIDE_KEYS=never awg show "${PROBE_INTERFACE}" header-protection-key 2>/dev/null || true)"
-			READ_CONTENT="$(awg show "${PROBE_INTERFACE}" content-padding-addition 2>/dev/null || true)"
-			READ_REKEY_AFTER="$(awg show "${PROBE_INTERFACE}" rekey-after-time 2>/dev/null || true)"
-			READ_REKEY_TIMEOUT="$(awg show "${PROBE_INTERFACE}" rekey-timeout 2>/dev/null || true)"
-			READ_REJECT="$(awg show "${PROBE_INTERFACE}" reject-after-time 2>/dev/null || true)"
-			READ_KEEPALIVE="$(awg show "${PROBE_INTERFACE}" keepalive-timeout 2>/dev/null || true)"
+		if awg setconf "${PROBE_INTERFACE}" "${PROBE_CONF}" 3>&- >/dev/null 2>"${PROBE_STDERR}"; then
+			READ_KEY="$(WG_HIDE_KEYS=never awg show "${PROBE_INTERFACE}" header-protection-key 3>&- 2>/dev/null || true)"
+			READ_CONTENT="$(awg show "${PROBE_INTERFACE}" content-padding-addition 3>&- 2>/dev/null || true)"
+			READ_REKEY_AFTER="$(awg show "${PROBE_INTERFACE}" rekey-after-time 3>&- 2>/dev/null || true)"
+			READ_REKEY_TIMEOUT="$(awg show "${PROBE_INTERFACE}" rekey-timeout 3>&- 2>/dev/null || true)"
+			READ_REJECT="$(awg show "${PROBE_INTERFACE}" reject-after-time 3>&- 2>/dev/null || true)"
+			READ_KEEPALIVE="$(awg show "${PROBE_INTERFACE}" keepalive-timeout 3>&- 2>/dev/null || true)"
 			if [[ "${READ_KEY}" == "${PROBE_KEY}" ]] && \
 				[[ "${READ_CONTENT}" == "11-13" ]] && \
 				[[ "${READ_REKEY_AFTER}" == "101-103" ]] && \
@@ -2367,8 +2383,8 @@ EOF
 				FAIL_DETAIL="$(awgBackendValidationText readback30)"
 			fi
 			if (( REQUIRE_31 )) && (( RC == 0 )); then
-				READ_TRAILERS="$(awg show "${PROBE_INTERFACE}" random-trailers 2>/dev/null || true)"
-				READ_COOKIES="$(awg show "${PROBE_INTERFACE}" disable-cookies 2>/dev/null || true)"
+				READ_TRAILERS="$(awg show "${PROBE_INTERFACE}" random-trailers 3>&- 2>/dev/null || true)"
+				READ_COOKIES="$(awg show "${PROBE_INTERFACE}" disable-cookies 3>&- 2>/dev/null || true)"
 				if [[ "${READ_TRAILERS}" != "on" ]] || [[ "${READ_COOKIES}" != "on" ]]; then
 					RC=1
 					FAIL_DETAIL="$(awgBackendValidationText readback31)"
@@ -2387,19 +2403,19 @@ EOF
 	fi
 
 	if (( INTERFACE_CREATED )); then
-		awgBackendDestroyScratchInterface "${PROBE_INTERFACE}" >/dev/null 2>&1 || RC=1
+		awgBackendDestroyScratchInterface "${PROBE_INTERFACE}" 3>&- >/dev/null 2>&1 || RC=1
 	fi
 	rm -f -- "${PROBE_CONF}" "${PROBE_STDERR}"
 	rmdir -- "${PROBE_DIR}" 2>/dev/null || true
 
 	if (( RC != 0 )); then
-		echo "ERROR: ${PROBE_LABEL} $(awgBackendValidationText summary)" >&2
+		reportAwgProtocolDiagnostic "ERROR: ${PROBE_LABEL} $(awgBackendValidationText summary)"
 		if [[ -n "${FAIL_DETAIL}" ]]; then
-			echo "       ${FAIL_DETAIL}" >&2
+			reportAwgProtocolDiagnostic "       ${FAIL_DETAIL}"
 		else
-			echo "       The temporary interface could not apply and read back every ${PROBE_LABEL} field." >&2
+			reportAwgProtocolDiagnostic "       The temporary interface could not apply and read back every ${PROBE_LABEL} field."
 		fi
-		echo "       Package version strings are ignored; only a live apply/readback probe is accepted." >&2
+		reportAwgProtocolDiagnostic "       Package version strings are ignored; only a live apply/readback probe is accepted."
 		return 1
 	fi
 	return 0
@@ -11703,8 +11719,8 @@ function validateStagedAwgConfigs() { # <work dir> [--label <description>] <conf
 		shift
 	done
 
-	if ! awgBackendCreateScratchInterface "${VALIDATE_INTERFACE}" >/dev/null 2>&1; then
-		echo "ERROR: could not create the temporary AWG configuration-validation interface" >&2
+	if ! awgBackendCreateScratchInterface "${VALIDATE_INTERFACE}" 3>&- >/dev/null 2>&1; then
+		reportAwgProtocolDiagnostic "ERROR: could not create the temporary AWG configuration-validation interface"
 		return 1
 	fi
 	INTERFACE_CREATED=1
@@ -11714,7 +11730,7 @@ function validateStagedAwgConfigs() { # <work dir> [--label <description>] <conf
 		INDEX=$((INDEX + 1))
 		STRIPPED_FILE="${WORK_DIR}/validate-${INDEX}.stripped"
 		INTERFACE_FILE="${WORK_DIR}/validate-${INDEX}.interface"
-		if ! awg-quick strip "${CONFIG_FILE}" >"${STRIPPED_FILE}" 2>"${STDERR_FILE}"; then
+		if ! awg-quick strip "${CONFIG_FILE}" 3>&- >"${STRIPPED_FILE}" 2>"${STDERR_FILE}"; then
 			reportAwgToolFailure "awg-quick strip rejected ${CONFIG_LABEL}" "${STDERR_FILE}"
 			RC=1
 			break
@@ -11739,7 +11755,7 @@ function validateStagedAwgConfigs() { # <work dir> [--label <description>] <conf
 					PORTS=$((PORTS + 1))
 					PORT="${CLEAN#*=}"
 					if ((PORTS > 1)) || ! [[ "${PORT}" =~ ^[1-9][0-9]{0,4}$ ]] || ((10#${PORT} > 65535)); then
-						echo "ERROR: ${CONFIG_LABEL} must set ListenPort at most once, to a port number from 1 to 65535" >&2
+						reportAwgProtocolDiagnostic "ERROR: ${CONFIG_LABEL} must set ListenPort at most once, to a port number from 1 to 65535"
 						RC=1
 						break
 					fi
@@ -11749,20 +11765,20 @@ function validateStagedAwgConfigs() { # <work dir> [--label <description>] <conf
 			printf '%s\n' "${LINE}" >>"${INTERFACE_FILE}"
 		done <"${STRIPPED_FILE}"
 		((RC == 0)) || break
-		if ! awg setconf "${VALIDATE_INTERFACE}" "${INTERFACE_FILE}" >/dev/null 2>"${STDERR_FILE}"; then
+		if ! awg setconf "${VALIDATE_INTERFACE}" "${INTERFACE_FILE}" 3>&- >/dev/null 2>"${STDERR_FILE}"; then
 			reportAwgToolFailure "awg setconf rejected ${CONFIG_LABEL}" "${STDERR_FILE}"
 			RC=1
 			break
 		fi
 	done
 
-	if (( INTERFACE_CREATED )) && ! awgBackendDestroyScratchInterface "${VALIDATE_INTERFACE}" >/dev/null 2>"${STDERR_FILE}"; then
+	if (( INTERFACE_CREATED )) && ! awgBackendDestroyScratchInterface "${VALIDATE_INTERFACE}" 3>&- >/dev/null 2>"${STDERR_FILE}"; then
 		reportAwgToolFailure "could not delete the temporary AWG configuration-validation interface ${VALIDATE_INTERFACE}" "${STDERR_FILE}"
 		RC=1
 	fi
 	rm -f -- "${STDERR_FILE}"
 	if (( RC != 0 )); then
-		echo "ERROR: $(awgBackendValidationText staged)" >&2
+		reportAwgProtocolDiagnostic "ERROR: $(awgBackendValidationText staged)"
 		return 1
 	fi
 }
@@ -11824,14 +11840,16 @@ function applyAwgProtocolTransaction() (
 	# A config that omits AWG 3.0 fields cannot clear those live attributes via
 	# syncconf. Cycle a manually managed interface so the kernel receives a fresh
 	# setconf from the selected protocol configuration.
+	# Close the diagnostic descriptor on both forward and recovery commands:
+	# awg-quick executes arbitrary hooks, whose output is never a safe diagnostic.
 	function restartManualAwgInterface() {
 		if ip link show dev "${SERVER_AWG_NIC}" >/dev/null 2>&1; then
-			awg-quick down "${SERVER_AWG_CONF}" >/dev/null 2>&1 || true
+			awg-quick down "${SERVER_AWG_CONF}" 3>&- >/dev/null 2>&1 || true
 			if ip link show dev "${SERVER_AWG_NIC}" >/dev/null 2>&1; then
 				ip link delete dev "${SERVER_AWG_NIC}" >/dev/null 2>&1 || return 1
 			fi
 		fi
-		awgBackendQuickUp "${SERVER_AWG_CONF}" || return 1
+		awgBackendQuickUp "${SERVER_AWG_CONF}" 3>&- || return 1
 		ip link show dev "${SERVER_AWG_NIC}" >/dev/null 2>&1
 	}
 
@@ -11840,9 +11858,9 @@ function applyAwgProtocolTransaction() (
 	# let each caller report the transaction directory retained for recovery.
 	function restorePreviousAwgRuntime() {
 		if (( SERVICE_WAS_ACTIVE )); then
-			awgBackendPrepareServiceStart
-			systemctl restart "awg-quick@${SERVER_AWG_NIC}" >/dev/null 2>&1 && \
-				systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"
+			awgBackendPrepareServiceStart 3>&-
+			systemctl restart "awg-quick@${SERVER_AWG_NIC}" 3>&- >/dev/null 2>&1 && \
+				systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}" 3>&-
 		elif (( MANUAL_INTERFACE_ACTIVE )); then
 			restartManualAwgInterface >/dev/null 2>&1
 		else
@@ -11854,17 +11872,17 @@ function applyAwgProtocolTransaction() (
 		local EXIT_CODE="$1"
 		local RESTORE_FAILED=0
 		trap '' HUP INT TERM
-		echo "ERROR: protocol migration interrupted; restoring server and client files" >&2
+		reportAwgProtocolDiagnostic "ERROR: protocol migration interrupted; restoring server and client files"
 		if (( TRANSACTION_READY != 0 && TRANSACTION_APPLY_STARTED != 0 )); then
 			if ! restoreAwgProtocolTransaction "${SERVER_BACKUP}" "${PARAMS_BACKUP}" \
 				CLIENT_PATHS CLIENT_BACKUPS >/dev/null 2>&1; then
 				RESTORE_FAILED=1
-				echo "ERROR: interrupted rollback was incomplete; recovery files remain in ${TRANSACTION_DIR}" >&2
+				reportAwgProtocolDiagnostic "ERROR: interrupted rollback was incomplete; recovery files remain in ${TRANSACTION_DIR}"
 			fi
 			if ! restorePreviousAwgRuntime; then
 				RESTORE_FAILED=1
-				echo "ERROR: interrupted rollback could not reactivate the previous AWG runtime" >&2
-				echo "       Recovery files remain in ${TRANSACTION_DIR}" >&2
+				reportAwgProtocolDiagnostic "ERROR: interrupted rollback could not reactivate the previous AWG runtime"
+				reportAwgProtocolDiagnostic "       Recovery files remain in ${TRANSACTION_DIR}"
 			fi
 		fi
 		if (( RESTORE_FAILED == 0 )) && [[ -n "${TRANSACTION_DIR:-}" ]]; then
@@ -11878,7 +11896,7 @@ function applyAwgProtocolTransaction() (
 	trap 'rollbackAwgProtocolOnSignal 143' TERM
 
 	TRANSACTION_DIR="$(mktemp -d "${AMNEZIAWG_DIR}/.awg-protocol.XXXXXX")" || {
-		echo "ERROR: could not create the AWG protocol transaction directory" >&2
+		reportAwgProtocolDiagnostic "ERROR: could not create the AWG protocol transaction directory"
 		return 1
 	}
 	chmod 700 "${TRANSACTION_DIR}"
@@ -11925,24 +11943,24 @@ function applyAwgProtocolTransaction() (
 	fi
 	TRANSACTION_READY=1
 
-	if systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}"; then
+	if systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}" 3>&-; then
 		SERVICE_WAS_ACTIVE=1
 	elif ip link show dev "${SERVER_AWG_NIC}" >/dev/null 2>&1; then
 		MANUAL_INTERFACE_ACTIVE=1
 	fi
 	TRANSACTION_APPLY_STARTED=1
-	if (( SERVICE_WAS_ACTIVE )) && ! systemctl stop "awg-quick@${SERVER_AWG_NIC}"; then
-		echo "ERROR: could not stop the AWG service before protocol migration" >&2
+	if (( SERVICE_WAS_ACTIVE )) && ! systemctl stop "awg-quick@${SERVER_AWG_NIC}" 3>&-; then
+		reportAwgProtocolDiagnostic "ERROR: could not stop the AWG service before protocol migration"
 		if ! restorePreviousAwgRuntime; then
-			echo "ERROR: the previous AWG service could not be restored; recovery files remain in ${TRANSACTION_DIR}" >&2
+			reportAwgProtocolDiagnostic "ERROR: the previous AWG service could not be restored; recovery files remain in ${TRANSACTION_DIR}"
 			return 1
 		fi
 		cleanupAwgProtocolTransactionDir "${TRANSACTION_DIR}"
 		return 1
-	elif (( MANUAL_INTERFACE_ACTIVE )) && ! awg-quick down "${SERVER_AWG_CONF}"; then
-		echo "ERROR: could not stop the manually active AWG interface before protocol migration" >&2
+	elif (( MANUAL_INTERFACE_ACTIVE )) && ! awg-quick down "${SERVER_AWG_CONF}" 3>&-; then
+		reportAwgProtocolDiagnostic "ERROR: could not stop the manually active AWG interface before protocol migration"
 		if ! restorePreviousAwgRuntime; then
-			echo "ERROR: the previous manually managed AWG interface could not be restored; recovery files remain in ${TRANSACTION_DIR}" >&2
+			reportAwgProtocolDiagnostic "ERROR: the previous manually managed AWG interface could not be restored; recovery files remain in ${TRANSACTION_DIR}"
 			return 1
 		fi
 		cleanupAwgProtocolTransactionDir "${TRANSACTION_DIR}"
@@ -11963,21 +11981,21 @@ function applyAwgProtocolTransaction() (
 	fi
 
 	if (( APPLY_FAILED == 0 && SERVICE_WAS_ACTIVE )); then
-		awgBackendPrepareServiceStart
-		systemctl restart "awg-quick@${SERVER_AWG_NIC}" || APPLY_FAILED=1
+		awgBackendPrepareServiceStart 3>&-
+		systemctl restart "awg-quick@${SERVER_AWG_NIC}" 3>&- || APPLY_FAILED=1
 	elif (( APPLY_FAILED == 0 && MANUAL_INTERFACE_ACTIVE )); then
-		awgBackendQuickUp "${SERVER_AWG_CONF}" || APPLY_FAILED=1
+		awgBackendQuickUp "${SERVER_AWG_CONF}" 3>&- || APPLY_FAILED=1
 	fi
 
 	if (( APPLY_FAILED != 0 )); then
-		echo "ERROR: protocol migration failed; restoring every server and client file" >&2
+		reportAwgProtocolDiagnostic "ERROR: protocol migration failed; restoring every server and client file"
 		if ! restoreAwgProtocolTransaction "${SERVER_BACKUP}" "${PARAMS_BACKUP}" CLIENT_PATHS CLIENT_BACKUPS; then
-			echo "ERROR: automatic rollback was incomplete; recovery files remain in ${TRANSACTION_DIR}" >&2
+			reportAwgProtocolDiagnostic "ERROR: automatic rollback was incomplete; recovery files remain in ${TRANSACTION_DIR}"
 			return 1
 		fi
 		if ! restorePreviousAwgRuntime; then
-			echo "ERROR: automatic rollback restored files but could not reactivate the previous AWG runtime" >&2
-			echo "       Recovery files remain in ${TRANSACTION_DIR}" >&2
+			reportAwgProtocolDiagnostic "ERROR: automatic rollback restored files but could not reactivate the previous AWG runtime"
+			reportAwgProtocolDiagnostic "       Recovery files remain in ${TRANSACTION_DIR}"
 			return 1
 		fi
 		cleanupAwgProtocolTransactionDir "${TRANSACTION_DIR}"
@@ -12001,7 +12019,7 @@ function setAwgProtocolMode() (
 		3|3.0) TARGET_MODE="${AWG_PROTOCOL_VERSION_3}" ;;
 		3.1) TARGET_MODE="${AWG_PROTOCOL_VERSION_31}" ;;
 		*)
-			echo "ERROR: protocol mode must be 2, 3, or 3.1" >&2
+			reportAwgProtocolDiagnostic "ERROR: protocol mode must be 2, 3, or 3.1"
 			return 1
 			;;
 	esac
@@ -12038,7 +12056,7 @@ function setAwgProtocolMode() (
 			"${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_31}" ]]; then
 			# The capability probe needs only the module. Do not start an
 			# intentionally stopped service or collide with a manual interface.
-			ensureAwgBackendReady 0 >/dev/null 2>&1 || true
+			ensureAwgBackendReady 0 3>&- >/dev/null 2>&1 || true
 			if [[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_31}" ]]; then
 				probeAwg31Capability "${AWG_HEADER_PROTECTION_KEY}" || return 1
 				# Same-mode 3.1 can turn RandomTrailers on via params without
@@ -12055,18 +12073,18 @@ function setAwgProtocolMode() (
 			CONFIG_STATE_RC=$?
 		fi
 		if (( CONFIG_STATE_RC == 2 )); then
-			echo "ERROR: could not verify every active client config before repairing AWG protocol mode ${TARGET_LABEL}" >&2
+			reportAwgProtocolDiagnostic "ERROR: could not verify every active client config before repairing AWG protocol mode ${TARGET_LABEL}"
 			return 1
 		fi
 		REPAIRING_SAME_MODE=1
-		echo "WARNING: persisted AWG protocol mode ${TARGET_LABEL} does not match every server/client config; repairing the transaction." >&2
+		reportAwgProtocolDiagnostic "WARNING: persisted AWG protocol mode ${TARGET_LABEL} does not match every server/client config; repairing the transaction."
 	fi
 	if (( REPAIRING_SAME_MODE == 0 )) && \
 		[[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_2}" ]] && \
 		[[ "${TARGET_MODE}" != "${AWG_PROTOCOL_VERSION_2}" ]] && \
 		awg2StateNeedsLegacyMigration; then
-		echo "ERROR: this installation needs AWG 2.0 compatibility normalization before AWG 3.x can be enabled." >&2
-		echo "Run amneziawg-install.sh interactively, complete any prompted migration, and then retry." >&2
+		reportAwgProtocolDiagnostic "ERROR: this installation needs AWG 2.0 compatibility normalization before AWG 3.x can be enabled."
+		reportAwgProtocolDiagnostic "Run amneziawg-install.sh interactively, complete any prompted migration, and then retry."
 		return 1
 	fi
 	ORIGINAL_PROTOCOL="${AWG_PROTOCOL_VERSION}"
@@ -12087,9 +12105,9 @@ function setAwgProtocolMode() (
 		[[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_2}" ]] && clearAwg3Params
 		[[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_3}" ]] && clearAwg31Params
 	elif [[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_31}" ]]; then
-		ensureAwgBackendReady 0 >/dev/null 2>&1 || true
+		ensureAwgBackendReady 0 3>&- >/dev/null 2>&1 || true
 		if [[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_2}" ]]; then
-			NEW_KEY="$(awg genkey 2>/dev/null)" || NEW_KEY=""
+			NEW_KEY="$(awg genkey 3>&- 2>/dev/null)" || NEW_KEY=""
 			if ! probeAwg31Capability "${NEW_KEY}"; then
 				return 1
 			fi
@@ -12110,9 +12128,9 @@ function setAwgProtocolMode() (
 		AWG_DISABLE_COOKIES="${AWG31_DEFAULT_DISABLE_COOKIES}"
 		warnIfRandomTrailersSPaddingUnequal
 	elif [[ "${TARGET_MODE}" == "${AWG_PROTOCOL_VERSION_3}" ]]; then
-		ensureAwgBackendReady 0 >/dev/null 2>&1 || true
+		ensureAwgBackendReady 0 3>&- >/dev/null 2>&1 || true
 		if [[ "${AWG_PROTOCOL_VERSION}" == "${AWG_PROTOCOL_VERSION_2}" ]]; then
-			NEW_KEY="$(awg genkey 2>/dev/null)" || NEW_KEY=""
+			NEW_KEY="$(awg genkey 3>&- 2>/dev/null)" || NEW_KEY=""
 			if ! probeAwg3Capability "${NEW_KEY}"; then
 				return 1
 			fi
