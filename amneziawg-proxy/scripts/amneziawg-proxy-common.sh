@@ -3,7 +3,7 @@
 # Shared helpers sourced by both amneziawg-proxy-install.sh and
 # amneziawg-proxy-uninstall.sh.  Not intended to be executed directly.
 #
-# https://github.com/wiresock/amneziawg-install
+# https://github.com/wiresock/awg-server-tools
 
 # ── Shared validation helpers ─────────────────────────────────────────────────
 

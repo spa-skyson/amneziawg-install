@@ -26,7 +26,7 @@
 #   Data dir:     /var/lib/amneziawg-web/
 #   Systemd unit: /etc/systemd/system/amneziawg-web.service
 #
-# https://github.com/wiresock/amneziawg-install
+# https://github.com/wiresock/awg-server-tools
 
 set -euo pipefail
 

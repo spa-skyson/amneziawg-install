@@ -7,8 +7,8 @@ Thank you for your interest in contributing to `amneziawg-web`.
 ## Getting started
 
 ```bash
-git clone https://github.com/wiresock/amneziawg-install.git
-cd amneziawg-install/amneziawg-web
+git clone https://github.com/wiresock/awg-server-tools.git
+cd awg-server-tools/amneziawg-web
 
 # Build
 cargo build

@@ -380,7 +380,7 @@ release old5 0.6.5 "4444444444444444444444444444444444444444" 1
 pin_to() {
 	local NAME="$1"
 	AWG_BT_RELEASE_TAG="${TAG_[${NAME}]}"
-	AWG_BT_RELEASE_BASE_URL="https://github.com/wiresock/amneziawg-install/releases/download/${TAG_[${NAME}]}"
+	AWG_BT_RELEASE_BASE_URL="https://github.com/wiresock/awg-server-tools/releases/download/${TAG_[${NAME}]}"
 	AWG_BT_RELEASE_VERSION="${VERSION_[${NAME}]}"
 	AWG_BT_RELEASE_SOURCE_COMMIT="${COMMIT_[${NAME}]}"
 	AWG_BT_RELEASE_BUILD="${BUILD_[${NAME}]}"

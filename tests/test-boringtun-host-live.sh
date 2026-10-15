@@ -490,6 +490,7 @@ if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
 	[[ -z "${PROBLEMS}" ]] || sed 's/^/    | /' <<<"${PROBLEMS}"
 	check "the earlier installer embeds a consistent release in the format ${PREV_FORMAT}" test -z "${PROBLEMS}"
 	PREV_TAG="$(btc_embedded_value "${PREVIOUS}" TAG)"
+	PREV_BASE_URL="$(btc_embedded_value "${PREVIOUS}" BASE_URL)"
 	PREV_SOURCE_COMMIT="$(btc_embedded_value "${PREVIOUS}" SOURCE_COMMIT)"
 	PREV_ASSET="$(btc_embedded_value "${PREVIOUS}" "ASSET_${ARCH_KEY}")"
 	PREV_ARCHIVE_SHA256="$(btc_embedded_value "${PREVIOUS}" "ARCHIVE_SHA256_${ARCH_KEY}")"
@@ -501,7 +502,7 @@ if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
 		test "${PREV_TAG}" != "${RELEASE_TAG}" -a "${PREV_ID}" != "${RELEASE_ID}" \
 		-a "${PREV_ARCHIVE_SHA256}" != "${ARCHIVE_SHA256}" -a "${PREV_BINARY_SHA256}" != "${BINARY_SHA256}"
 	check "it downloaded its own public release ${PREV_TAG}" \
-		grep -qF "Downloading https://github.com/wiresock/amneziawg-install/releases/download/${PREV_TAG}/${PREV_ASSET}" "${WORK}/install.log"
+		grep -qF "Downloading ${PREV_BASE_URL}/${PREV_ASSET}" "${WORK}/install.log"
 	check "  and not this installer's release" bash -c '! grep -qF "/$1/" "$2"' _ "${RELEASE_TAG}" "${WORK}/install.log"
 	check "the store selects the earlier release ${PREV_ID}, with no previous release" test "$(store_links)" = "${PREV_ID} none"
 	check "  its binary has the earlier installer's embedded SHA-256" \
@@ -510,7 +511,7 @@ if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
 		bash -c 'grep -qx "source_commit=$2" "$1" && grep -qx "binary_sha256=$3" "$1"' _ \
 		"${STORE}/${PREV_ID}/MANIFEST" "${PREV_SOURCE_COMMIT}" "${PREV_BINARY_SHA256}"
 	curl --proto '=https' --proto-redir '=https' -fsSL --retry 3 -o "${WORK}/${PREV_ASSET}" \
-		"https://github.com/wiresock/amneziawg-install/releases/download/${PREV_TAG}/${PREV_ASSET}"
+		"${PREV_BASE_URL}/${PREV_ASSET}"
 	check "  its public URL serves the earlier installer's embedded archive SHA-256" \
 		test "$(sha256sum "${WORK}/${PREV_ASSET}" 2>/dev/null | cut -d' ' -f1)" = "${PREV_ARCHIVE_SHA256}"
 	check "  and the installed release is that archive's content" \
@@ -555,7 +556,7 @@ record_config_secrets "${CLIENT_CONF}"
 # the earlier daemon, leaves behind.
 if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
 	echo "=== Upgrade from the earlier installer's release: --upgrade-boringtun"
-	RELEASE_DOWNLOAD="Downloading https://github.com/wiresock/amneziawg-install/releases/download/${RELEASE_TAG}/${ASSET}"
+	RELEASE_DOWNLOAD="Downloading https://github.com/wiresock/awg-server-tools/releases/download/${RELEASE_TAG}/${ASSET}"
 	upgraded_links() {
 		test "$(store_links)" = "${RELEASE_ID} ${PREV_ID}"
 	}
@@ -617,7 +618,7 @@ if [[ -n "${AWG_LIVE_PREVIOUS_INSTALLER:-}" ]]; then
 fi
 
 check "it downloaded the public release ${RELEASE_TAG}" \
-	grep -qF "Downloading https://github.com/wiresock/amneziawg-install/releases/download/${RELEASE_TAG}/${ASSET}" "${RELEASE_LOG}"
+	grep -qF "Downloading https://github.com/wiresock/awg-server-tools/releases/download/${RELEASE_TAG}/${ASSET}" "${RELEASE_LOG}"
 check "the BoringTun preflight passed" grep -qF "BoringTun preflight passed" "${WORK}/install.log"
 check "no AmneziaWG kernel module is loaded" no_kernel_module
 check "no AmneziaWG kernel module is installed" bash -c '! modinfo -n amneziawg >/dev/null 2>&1'
@@ -1255,7 +1256,7 @@ RC=$?
 tail -n 6 "${WORK}/upgrade.log" | sed 's/^/    | /'
 check "--upgrade-boringtun succeeds" test "${RC}" -eq 0
 check "  it downloaded the pinned release from its public URL" \
-	grep -qF "Downloading https://github.com/wiresock/amneziawg-install/releases/download/${RELEASE_TAG}/${ASSET}" "${WORK}/upgrade.log"
+	grep -qF "Downloading https://github.com/wiresock/awg-server-tools/releases/download/${RELEASE_TAG}/${ASSET}" "${WORK}/upgrade.log"
 check "  current is the pinned release and previous the fixture" test "$(store_links)" = "${RELEASE_ID} ${FIXTURE_ID}"
 check "  the pinned binary has the embedded SHA-256" test "$(sha256sum "${STORE}/${RELEASE_ID}/boringtun-cli" | cut -d' ' -f1)" = "${BINARY_SHA256}"
 check "  the daemon was restarted onto it" test "$(main_pid)" != "${PID}" -a "$(bt_unit_release "${UNIT}" "${STORE}")" = "${RELEASE_ID}"

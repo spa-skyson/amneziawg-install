@@ -1,7 +1,7 @@
 [Unit]
 Description=AmneziaWG Web Management Panel
 After=network.target
-Documentation=https://github.com/wiresock/amneziawg-install
+Documentation=https://github.com/wiresock/awg-server-tools
 
 [Service]
 Type=simple

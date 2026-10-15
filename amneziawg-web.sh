@@ -10,12 +10,12 @@
 #
 # Run any command with --help for command-specific options.
 #
-# https://github.com/wiresock/amneziawg-install
+# https://github.com/wiresock/awg-server-tools
 
 set -euo pipefail
 
 # To avoid privilege-escalation via environment injection, overrides are ignored when EUID=0.
-readonly DEFAULT_REPO_URL="https://github.com/wiresock/amneziawg-install.git"
+readonly DEFAULT_REPO_URL="https://github.com/wiresock/awg-server-tools.git"
 readonly DEFAULT_REPO_REF="main"
 
 _AWG_IS_ROOT=1

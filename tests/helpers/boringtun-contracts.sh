@@ -20,7 +20,9 @@
 # Nothing here compares 3 with 1 or 2.
 
 BTC_SOURCE_REPOSITORY="https://github.com/Wiresock-Foundation/wiresock-boringtun"
-BTC_RELEASE_DOWNLOAD_URL="https://github.com/wiresock/amneziawg-install/releases/download"
+BTC_RELEASE_DOWNLOAD_URL="https://github.com/wiresock/awg-server-tools/releases/download"
+# Historical installers embed this URL; GitHub redirects the renamed repository.
+BTC_LEGACY_RELEASE_DOWNLOAD_URL="https://github.com/wiresock/amneziawg-install/releases/download"
 BTC_EMBEDDED_NAMES="TAG BASE_URL VERSION SOURCE_REPOSITORY SOURCE_COMMIT BUILD
 ASSET_X86_64 ARCHIVE_SHA256_X86_64 BINARY_SHA256_X86_64
 ASSET_AARCH64 ARCHIVE_SHA256_AARCH64 BINARY_SHA256_AARCH64"
@@ -81,8 +83,9 @@ _btc_embedded_release_problems() { # <installer> <with-build | without-build>
 	STEM="boringtun-cli-${E[VERSION]}-g${E[SOURCE_COMMIT]:0:12}"
 	[[ "${E[TAG]}" == "${STEM}-b${E[BUILD]}" ]] ||
 		echo "AWG_BT_RELEASE_TAG '${E[TAG]}' is not ${STEM}-b${E[BUILD]}"
-	[[ "${E[BASE_URL]}" == "${BTC_RELEASE_DOWNLOAD_URL}/${E[TAG]}" ]] ||
-		echo "AWG_BT_RELEASE_BASE_URL '${E[BASE_URL]}' is not ${BTC_RELEASE_DOWNLOAD_URL}/${E[TAG]}"
+	[[ "${E[BASE_URL]}" == "${BTC_RELEASE_DOWNLOAD_URL}/${E[TAG]}" ||
+		"${E[BASE_URL]}" == "${BTC_LEGACY_RELEASE_DOWNLOAD_URL}/${E[TAG]}" ]] ||
+		echo "AWG_BT_RELEASE_BASE_URL '${E[BASE_URL]}' is not an exact current or historical repository URL for ${E[TAG]}"
 	for ARCH in X86_64:x86_64 AARCH64:aarch64; do
 		[[ "${E[ASSET_${ARCH%%:*}]}" == "${STEM}-linux-${ARCH#*:}-musl.tar.gz" ]] ||
 			echo "AWG_BT_RELEASE_ASSET_${ARCH%%:*} '${E[ASSET_${ARCH%%:*}]}' is not ${STEM}-linux-${ARCH#*:}-musl.tar.gz"

@@ -24,7 +24,7 @@ proposal requires a change to `wiresock-boringtun`.
 
 | Repository | Revision | Notes |
 |---|---|---|
-| `wiresock/amneziawg-install` | `67fd5ce` (main, 2026-09-24) | All line numbers in this document refer to this revision. |
+| `wiresock/amneziawg-install` (now `wiresock/awg-server-tools`) | `67fd5ce` (main, 2026-09-24) | All line numbers in this document refer to this revision. |
 | `Wiresock-Foundation/wiresock-boringtun` | `e4e4dc8` (master, 2026-09-24) | `boringtun-cli` reports version `0.7.1`. |
 | `amnezia-vpn/amneziawg-tools` | `ee0f0a9` (v3.1.20260812) | The Amnezia PPA currently ships this exact commit for focal and noble, amd64 and arm64. |
 | `amnezia-vpn/amneziawg-linux-kernel-module` | `4569c4c` | The PPA's `amneziawg-dkms` is built from this commit. |

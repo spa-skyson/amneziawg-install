@@ -130,7 +130,7 @@ case \"\${URL}\" in
 		case \"\${URL}\" in */resolute/*) printf 404 ;; *) printf 200 ;; esac ;;
 	https://keyserver.ubuntu.com/*)
 		printf -- '-----BEGIN PGP PUBLIC KEY BLOCK-----\nMOCKKEY\n-----END PGP PUBLIC KEY BLOCK-----\n' >\"\${OUT}\" ;;
-	https://github.com/wiresock/amneziawg-install/releases/download/*)
+	https://github.com/wiresock/awg-server-tools/releases/download/*)
 		cp -- \"${MOCK}/serve/\${URL##*/}\" \"\${OUT}\" || exit 22 ;;
 	*) exit 6 ;;
 esac"
@@ -267,7 +267,7 @@ else
 	check "Ubuntu: the Amnezia PPA source is configured" bash -c 'grep -l "ppa.launchpadcontent.net/amnezia/ppa/ubuntu" /etc/apt/sources.list.d/*.sources >/dev/null'
 fi
 check "the release is downloaded from its exact public URL over HTTPS" \
-	grep -q "^curl --proto =https --proto-redir =https .* https://github.com/wiresock/amneziawg-install/releases/download/boringtun-cli-${VERSION}-g${COMMIT:0:12}-b1/${ASSET}\$" "${LOG}"
+	grep -q "^curl --proto =https --proto-redir =https .* https://github.com/wiresock/awg-server-tools/releases/download/boringtun-cli-${VERSION}-g${COMMIT:0:12}-b1/${ASSET}\$" "${LOG}"
 STORE=/usr/local/lib/amneziawg-install/boringtun
 check "the store holds the release and its current link" test "$(readlink "${STORE}/current")" = "${REL_ID}"
 check "the store is root-owned and not writable by others" test "$(stat -c '%u %a' "${STORE}" "${STORE}/${REL_ID}" "${STORE}/${REL_ID}/boringtun-cli" | tr '\n' ' ')" = "0 755 0 755 0 755 "

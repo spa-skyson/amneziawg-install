@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # AmneziaWG server installer
-# https://github.com/wiresock/amneziawg-install
+# https://github.com/wiresock/awg-server-tools
 
 RED='\033[0;31m'
 ORANGE='\033[0;33m'
@@ -103,7 +103,7 @@ AWG_INSTALLER_CAPABILITY_PROTOCOL_DIAGNOSTICS="protocol-diagnostics-v1"
 # are internally consistent, and tests/test-boringtun-public-release.sh that
 # the release is public with exactly these bytes.
 AWG_BT_RELEASE_TAG="boringtun-cli-0.7.1-gb94943906b11-b1"
-AWG_BT_RELEASE_BASE_URL="https://github.com/wiresock/amneziawg-install/releases/download/boringtun-cli-0.7.1-gb94943906b11-b1"
+AWG_BT_RELEASE_BASE_URL="https://github.com/wiresock/awg-server-tools/releases/download/boringtun-cli-0.7.1-gb94943906b11-b1"
 AWG_BT_RELEASE_VERSION="0.7.1"
 AWG_BT_RELEASE_SOURCE_REPOSITORY="https://github.com/Wiresock-Foundation/wiresock-boringtun"
 AWG_BT_RELEASE_SOURCE_COMMIT="b94943906b11641e274b3c950cc905aaf1631c59"
@@ -8806,7 +8806,7 @@ function installQuestions() {
 	SERVER_AWG_S3=""
 	SERVER_AWG_S4=""
 
-	echo "AmneziaWG server installer (https://github.com/wiresock/amneziawg-install)"
+	echo "AmneziaWG server installer (https://github.com/wiresock/awg-server-tools)"
 	echo ""
 	echo "I need to ask you a few questions before starting the setup."
 	echo "You can keep the default options and just press enter if you are ok with them."
@@ -13213,7 +13213,7 @@ function runLockedManagementOperation() (
 
 function manageMenu() {
 	local MENU_OPTION=""
-	echo "AmneziaWG server installer (https://github.com/wiresock/amneziawg-install)"
+	echo "AmneziaWG server installer (https://github.com/wiresock/awg-server-tools)"
 	echo ""
 	echo "It looks like AmneziaWG is already installed."
 	echo ""

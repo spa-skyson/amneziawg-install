@@ -268,8 +268,8 @@ home paths.
 ```bash
 sha256sum -c SHA256SUMS
 bash scripts/boringtun-artifact.sh verify-archive boringtun-cli-*-linux-"$(uname -m)"-musl.tar.gz /tmp/boringtun-check
-gh attestation verify boringtun-cli-*-linux-"$(uname -m)"-musl.tar.gz --repo wiresock/amneziawg-install \
-    --cert-identity https://github.com/wiresock/amneziawg-install/.github/workflows/boringtun-artifacts.yml@refs/heads/main \
+gh attestation verify boringtun-cli-*-linux-"$(uname -m)"-musl.tar.gz --repo wiresock/awg-server-tools \
+    --cert-identity https://github.com/wiresock/awg-server-tools/.github/workflows/boringtun-artifacts.yml@refs/heads/main \
     --source-digest <commit> --source-ref refs/heads/main --deny-self-hosted-runners
 ```
 
@@ -290,6 +290,12 @@ workflow whose file name merely starts with `boringtun-artifacts.yml` would
 pass it. As root,
 `device-smoke <binary>` also creates a TUN device, queries its UAPI socket and
 checks that the device disappears when the daemon stops.
+
+Artifacts signed before the repository rename retain `wiresock/amneziawg-install`
+in their signed repository and workflow identities. For those artifacts, use the
+original `--repo` and exact `--cert-identity` from their release notes, together
+with the original source digest. See [repository rename and compatibility](REPOSITORY_RENAME.md#signed-artifacts)
+for the historical command and release-publication guidance.
 
 ## What CI checks
 
@@ -413,7 +419,7 @@ attestation store. An installer uses exact URLs, never "latest" or any API
 lookup:
 
 ```
-https://github.com/wiresock/amneziawg-install/releases/download/<tag>/<asset>
+https://github.com/wiresock/awg-server-tools/releases/download/<tag>/<asset>
 ```
 
 ### Release contract
@@ -479,7 +485,7 @@ It then prints the exact tag, title, assets, archive and binary hashes and
 release notes it would publish, and changes nothing. The same checks run locally:
 
 ```bash
-GITHUB_REPOSITORY=wiresock/amneziawg-install bash scripts/boringtun-release.sh \
+GITHUB_REPOSITORY=wiresock/awg-server-tools bash scripts/boringtun-release.sh \
     dry-run <run-id> <commit> main /tmp/boringtun-release-check
 ```
 

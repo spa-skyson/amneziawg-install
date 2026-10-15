@@ -19,14 +19,14 @@
 # All installer logic lives in amneziawg-proxy/scripts/.
 # This file is a thin dispatcher that forwards to those scripts.
 #
-# https://github.com/wiresock/amneziawg-install
+# https://github.com/wiresock/awg-server-tools
 
 set -euo pipefail
 
 # This script always requires root. Repository source settings stay fixed to
 # prevent environment-based redirection; TMPDIR and AMNEZIAWG_BUILD_ROOT are
 # honored only when choosing temporary bootstrap and Cargo build filesystems.
-readonly REPO_URL="https://github.com/wiresock/amneziawg-install.git"
+readonly REPO_URL="https://github.com/wiresock/awg-server-tools.git"
 readonly REPO_REF="main"
 
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -317,7 +317,7 @@ is_proxy_installed() {
 # ── Management menu ───────────────────────────────────────────────────────────
 
 manage_menu() {
-    echo "amneziawg-proxy (https://github.com/wiresock/amneziawg-install)"
+    echo "amneziawg-proxy (https://github.com/wiresock/awg-server-tools)"
     echo ""
     echo "It looks like amneziawg-proxy is already installed."
     echo ""

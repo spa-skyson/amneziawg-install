@@ -20,7 +20,7 @@
 #   --purge-data     remove the data/working directory
 #   --restore-awg    restore AWG listen port from the proxy config backup
 #
-# https://github.com/wiresock/amneziawg-install
+# https://github.com/wiresock/awg-server-tools
 
 set -euo pipefail
 

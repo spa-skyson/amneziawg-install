@@ -75,7 +75,7 @@ assert_not_contains() { # <unexpected part> <actual> <name>
 	fi
 }
 
-REPO="wiresock/amneziawg-install"
+REPO="wiresock/awg-server-tools"
 PIN_COMMIT="0123456789abcdef0123456789abcdef01234567"
 C12="${PIN_COMMIT:0:12}"
 ARTIFACTS_COMMIT="89abcdef0123456789abcdef0123456789abcdef"
@@ -283,7 +283,7 @@ write_contract() { # <dir> [KEY=VALUE]...
 cat >"${BIN_DIR}/gh" <<'EOF'
 #!/usr/bin/env bash
 M="${MOCK}"
-R="wiresock/amneziawg-install"
+R="wiresock/awg-server-tools"
 printf '%s\n' "$*" >>"${M}/calls"
 fail() { printf 'mock gh: %s\n' "$*" >&2; exit 1; }
 case "${1:-}" in
@@ -638,7 +638,7 @@ write_embedded_installer() { # <file> <commit> <build> <x86_64 archive> <x86_64 
 	{
 		printf '#!/usr/bin/env bash\n# fixture installer: only the embedded release\n'
 		printf 'AWG_BT_RELEASE_TAG="%s-b%s"\n' "${STEM}" "$3"
-		printf 'AWG_BT_RELEASE_BASE_URL="https://github.com/wiresock/amneziawg-install/releases/download/%s-b%s"\n' "${STEM}" "$3"
+		printf 'AWG_BT_RELEASE_BASE_URL="https://github.com/wiresock/awg-server-tools/releases/download/%s-b%s"\n' "${STEM}" "$3"
 		printf 'AWG_BT_RELEASE_VERSION="0.7.1"\n'
 		printf 'AWG_BT_RELEASE_SOURCE_REPOSITORY="https://github.com/Wiresock-Foundation/wiresock-boringtun"\n'
 		printf 'AWG_BT_RELEASE_SOURCE_COMMIT="%s"\n' "$2"
@@ -997,7 +997,7 @@ attestation_refused '.ref = "refs/heads/feature"' "source ref refs/heads/feature
 	"an attestation of a build from another branch is refused"
 attestation_refused '.digest = "fedcba9876543210fedcba9876543210fedcba98"' "source digest fedcba98" \
 	"an attestation of a build of another commit is refused"
-attestation_refused '.repo = "someone/fork" | .identity |= sub("wiresock/amneziawg-install"; "someone/fork")' \
+attestation_refused '.repo = "someone/fork" | .identity |= sub("wiresock/awg-server-tools"; "someone/fork")' \
 	"no attestation in ${REPO}" "an attestation of another repository is refused"
 attestation_refused '.runner = "self-hosted"' "built on a self-hosted runner" \
 	"an attestation from a self-hosted runner is refused"

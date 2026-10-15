@@ -13,8 +13,8 @@ The installer builds from source by default. When you run it from a repository
 checkout, it auto-detects the source directory for you. It lives at the repository root next to `amneziawg-install.sh`:
 
 ```bash
-git clone https://github.com/wiresock/amneziawg-install.git
-cd amneziawg-install
+git clone https://github.com/wiresock/awg-server-tools.git
+cd awg-server-tools
 
 # 1. Install AmneziaWG (if not already done)
 sudo ./amneziawg-install.sh
@@ -80,8 +80,8 @@ To build manually:
 
 ```bash
 # Clone the repo (or download a release tarball)
-git clone https://github.com/wiresock/amneziawg-install.git
-cd amneziawg-install/amneziawg-web
+git clone https://github.com/wiresock/awg-server-tools.git
+cd awg-server-tools/amneziawg-web
 
 # Build the release binary
 cargo build --release
