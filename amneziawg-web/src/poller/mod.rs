@@ -489,9 +489,7 @@ impl Poller {
     ///
     /// This operation is idempotent:
     /// 1. All config-mapping fields are first reset to NULL / 0 for every peer.
-    /// 2. Each discovered config file is matched to a peer by `public_key`
-    ///    first; if no key match is found, a fallback match via AllowedIPs
-    ///    is attempted.
+    /// 2. Configs owned by the selected server are matched by client address.
     ///
     /// If the config directory cannot be read, a warning is logged and the
     /// step returns `Ok(())` — existing config-mapping fields are **not**
@@ -530,7 +528,8 @@ impl Poller {
             "config scan complete"
         );
 
-        apply_config_mappings(&self.db, &configs).await
+        let scope = self.interface.config_scope().await?;
+        apply_config_mappings(&self.db, &configs, scope.as_ref()).await
     }
 
     /// Purge snapshots older than `snapshot_retention_days` (if configured > 0).
@@ -613,6 +612,7 @@ impl Poller {
         interfaces: &[awg::AwgInterface],
         now: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<usize> {
+        self.interface.observe_interfaces(interfaces);
         let mut tx = self
             .db
             .pool
@@ -898,6 +898,7 @@ pub async fn sync_peers_from_awg(
         Err(e) => return Err(e.into()),
     };
     let interfaces = scope_to_interface(interfaces, mode.interface()).matched;
+    interface.observe_interfaces(&interfaces);
 
     let mut tx = db.pool.begin().await.context("begin sync_peers tx")?;
     for iface in &interfaces {
@@ -943,99 +944,62 @@ fn saturating_u64_to_i64(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
 }
 
-/// Extract the base IP address from a CIDR string (e.g. `"10.8.0.2/32"` → `"10.8.0.2"`).
-fn base_ip(cidr: &str) -> &str {
-    cidr.split('/').next().unwrap_or(cidr)
-}
-
 /// Shared config-to-peer mapping logic used by both the poller cycle and
-/// on-demand rescan.  Resets all mappings, then applies Strategy 1 (public-key)
-/// and Strategy 2 (AllowedIPs fallback) for each config.
+/// on-demand rescan. Requires server ownership before matching client addresses.
 ///
 /// Callers hold [`CONFIG_MAPPING_LOCK`] across both their directory scan and
 /// this clear-and-remap sequence.
 async fn apply_config_mappings(
     db: &crate::db::Database,
     configs: &[config_store::ClientConfig],
+    scope: Option<&crate::managed_interface::ConfigScope>,
 ) -> anyhow::Result<()> {
     // Reset all mapping fields so that removed configs don't persist.
     crate::db::peers::clear_all_config_mappings(&db.pool).await?;
 
-    // Load all peers from the DB for AllowedIPs fallback matching.
+    let Some(scope) = scope else { return Ok(()) };
+
+    // Include disabled/offline managed peers; monitoring is restricted below
+    // to peers observed on the selected interface.
     let all_peers = crate::db::peers::list_visible(&db.pool).await?;
 
-    let mut mapped: usize = 0;
     let mut mapped_by_ip: usize = 0;
-    for config in configs {
-        let path_str = config.path.to_string_lossy();
-        let managed_client_name = crate::admin::script_bridge::managed_client_name_from_config(
-            &config.name,
-            &config.friendly_name,
-        );
-
-        // ── Strategy 1: exact public-key match ──────────────────
-        //
-        // The `[Peer] PublicKey` in a client config refers to the
-        // *server's* key, so it will only match a peer whose public
-        // key happens to equal that value (i.e. if the config dir
-        // also contains server-side configs).  If no peer matches,
-        // we fall through to Strategy 2 instead of giving up.
-        if let Some(pk) = &config.peer_public_key {
-            match crate::db::peers::apply_config_mapping(
-                &db.pool,
-                &pk.0,
-                &config.name,
-                &path_str,
-                &config.friendly_name,
-                managed_client_name,
-            )
-            .await
-            {
-                Ok(true) => {
-                    mapped += 1;
-                    debug!(
-                        config = %config.name,
-                        friendly_name = %config.friendly_name,
-                        public_key = %pk,
-                        "config linked by public key"
-                    );
-                    continue;
-                }
-                Ok(false) => {
-                    // No peer matched this public key (common: the key
-                    // in a client config is normally the server's key).
-                    // Fall through to AllowedIPs matching.
-                    debug!(
-                        config = %config.name,
-                        public_key = %pk,
-                        "no peer matched [Peer] PublicKey – trying AllowedIPs fallback"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        config = %config.name,
-                        public_key = %pk,
-                        error = %e,
-                        "failed to apply config mapping – skipping"
-                    );
-                    continue;
-                }
+    // Live peers of a monitoring-only interface cannot have an installer
+    // lifecycle identity. Repair values assigned by older unscoped discovery
+    // without touching operator labels, comments or unrelated retained rows.
+    if !scope.mode.is_managing() {
+        for peer in &all_peers {
+            if scope.permits_peer(&peer.public_key) {
+                sqlx::query("UPDATE peers SET managed_client_name = NULL WHERE id = ?")
+                    .bind(peer.id)
+                    .execute(&db.pool)
+                    .await?;
             }
         }
+    }
+    for config in configs {
+        if !config.belongs_to(scope) {
+            continue;
+        }
+        let path_str = config.path.to_string_lossy();
+        let managed_client_name = scope
+            .mode
+            .is_managing()
+            .then(|| {
+                crate::admin::script_bridge::managed_client_name_from_config(
+                    &config.name,
+                    &config.friendly_name,
+                )
+            })
+            .flatten();
 
-        // ── Strategy 2: AllowedIPs fallback ─────────────────────
         // Attempt to match by comparing the config's Address field
         // with peer AllowedIPs.  Only match if unambiguous (exactly one).
         if !config.addresses.is_empty() {
             let candidates: Vec<_> = all_peers
                 .iter()
                 .filter(|p| {
-                    config.addresses.iter().any(|addr| {
-                        let addr_base = base_ip(addr);
-                        p.allowed_ips
-                            .split(',')
-                            .any(|a| base_ip(a.trim()) == addr_base)
-                    })
+                    scope.permits_peer(&p.public_key) && config.matches_addresses(&p.allowed_ips)
                 })
                 .collect();
 
@@ -1057,7 +1021,7 @@ async fn apply_config_mappings(
                             config = %config.name,
                             friendly_name = %config.friendly_name,
                             public_key = %peer.public_key,
-                            "config linked by AllowedIPs fallback"
+                            "owned config linked by client address"
                         );
                     }
                     Ok(false) => {
@@ -1084,20 +1048,19 @@ async fn apply_config_mappings(
             } else {
                 debug!(
                     config = %config.name,
-                    "no [Peer] PublicKey and no AllowedIPs match – skipping"
+                    "no matching peer address – skipping config mapping"
                 );
             }
         } else {
             debug!(
                 config = %config.name,
-                "config has no [Peer] PublicKey and no addresses – skipping"
+                "config has no client addresses – skipping config mapping"
             );
         }
     }
 
     info!(
         total_configs = configs.len(),
-        mapped_by_key = mapped,
         mapped_by_ip = mapped_by_ip,
         "config mapping applied"
     );
@@ -1112,6 +1075,7 @@ async fn apply_config_mappings(
 pub async fn rescan_configs(
     db: &crate::db::Database,
     config_dir: &std::path::Path,
+    interface: &InterfaceSelector,
 ) -> anyhow::Result<()> {
     let _guard = acquire_config_mapping_lock().await;
     let dir = config_dir.to_path_buf();
@@ -1139,7 +1103,8 @@ pub async fn rescan_configs(
         }
     };
 
-    apply_config_mappings(db, &configs).await?;
+    let scope = interface.config_scope().await?;
+    apply_config_mappings(db, &configs, scope.as_ref()).await?;
     info!("on-demand config rescan complete");
     Ok(())
 }
@@ -1148,6 +1113,292 @@ pub async fn rescan_configs(
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    fn config_scope_selector(monitored: &str) -> InterfaceSelector {
+        InterfaceSelector::from_override(Some(monitored))
+            .unwrap()
+            .with_params_reader(|| {
+                Ok(crate::managed_interface::test_params("awg0")
+                    .replace("SERVER_PUB_KEY='PUB'", "SERVER_PUB_KEY='AWG0_SERVER='"))
+            })
+    }
+
+    fn overlapping_interfaces() -> Vec<awg::AwgInterface> {
+        awg::parse_dump(
+            "awg0\tP0\tAWG0_SERVER=\t51820\toff\n\
+             awg0\tALICE_KEY=\t(none)\t(none)\t10.66.66.2/32\t0\t0\t0\toff\n\
+             awg1\tP1\tAWG1_SERVER=\t51821\toff\n\
+             awg1\tBOB_KEY=\t(none)\t(none)\t10.66.66.2/32\t0\t0\t0\toff\n",
+        )
+        .unwrap()
+    }
+
+    fn scoped_client_config(server: &str) -> String {
+        format!(
+            "[Interface]\nPrivateKey = PRIVATE_FIXTURE\nAddress = 10.66.66.2/32\n\
+             [Peer]\nPublicKey = {server}\nEndpoint = 198.51.100.1:51820\nAllowedIPs = 0.0.0.0/0\n"
+        )
+    }
+
+    async fn assert_config_exports(app: &axum::Router, id: i64, expected: axum::http::StatusCode) {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        for export in ["config", "vpn-uri", "qr"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/peers/{id}/{export}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{export}");
+        }
+    }
+
+    #[tokio::test]
+    async fn config_mapping_rejects_other_interfaces_and_repairs_monitoring_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("awg0-client-alice.conf"),
+            scoped_client_config("AWG0_SERVER="),
+        )
+        .unwrap();
+        let db = Database::connect_for_test().await.unwrap();
+        let selector = config_scope_selector("awg1");
+        selector.resolve_mode().unwrap();
+        let poller = Poller::new_full(
+            db.clone(),
+            30,
+            dir.path().into(),
+            dir.path().into(),
+            0,
+            selector,
+        );
+        let scoped = scope_to_interface(overlapping_interfaces(), "awg1").matched;
+        poller.record_poll_batch(&scoped, Utc::now()).await.unwrap();
+        // Metadata left by an older poller must not give Bob Alice's lifecycle
+        // identity. Operator-entered labels and notes remain Bob's own data.
+        sqlx::query("UPDATE peers SET managed_client_name = 'alice', display_name = 'Bob', comment = 'keep note'")
+            .execute(&db.pool).await.unwrap();
+        poller.apply_config_mapping_step().await.unwrap();
+        let bob = crate::db::peers::find_by_public_key(&db.pool, "BOB_KEY=")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            bob.has_config, 0,
+            "same IP does not prove interface ownership"
+        );
+        assert_eq!(bob.config_path, None);
+        assert_eq!(bob.managed_client_name, None);
+        assert_eq!(bob.display_name.as_deref(), Some("Bob"));
+        assert_eq!(bob.comment.as_deref(), Some("keep note"));
+    }
+
+    #[tokio::test]
+    async fn config_exports_reject_stale_mapping_before_first_monitoring_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("awg0-client-alice.conf");
+        std::fs::write(&path, scoped_client_config("AWG0_SERVER=")).unwrap();
+        let db = Database::connect_for_test().await.unwrap();
+        sqlx::query(
+            "INSERT INTO peers (public_key, allowed_ips) VALUES ('BOB_KEY=', '10.66.66.2/32')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        crate::db::peers::apply_config_mapping(
+            &db.pool,
+            "BOB_KEY=",
+            "awg0-client-alice",
+            path.to_str().unwrap(),
+            "alice",
+            Some("alice"),
+        )
+        .await
+        .unwrap();
+        let bob = crate::db::peers::find_by_public_key(&db.pool, "BOB_KEY=")
+            .await
+            .unwrap()
+            .unwrap();
+        let app = crate::web::router_with_lifecycle_lock_dir(
+            db,
+            crate::auth::AuthConfig::disabled(),
+            dir.path().into(),
+            dir.path().into(),
+            dir.path().join("missing-sessions.json"),
+            config_scope_selector("awg1"),
+        );
+        assert_config_exports(&app, bob.id, axum::http::StatusCode::NOT_FOUND).await;
+    }
+
+    #[tokio::test]
+    async fn config_exports_invalidate_observed_key_when_installer_scope_changes() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let changed = Arc::new(AtomicBool::new(false));
+        let reader_changed = changed.clone();
+        let selector = InterfaceSelector::from_params().with_params_reader(move || {
+            let (name, key) = if reader_changed.load(Ordering::SeqCst) {
+                ("awg1", "AWG1_SERVER=")
+            } else {
+                ("awg0", "AWG0_SERVER=")
+            };
+            Ok(crate::managed_interface::test_params(name)
+                .replace("SERVER_PUB_KEY='PUB'", &format!("SERVER_PUB_KEY='{key}'")))
+        });
+        selector.resolve_mode().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("awg0-client-alice.conf"),
+            scoped_client_config("AWG0_SERVER="),
+        )
+        .unwrap();
+        let db = Database::connect_for_test().await.unwrap();
+        let poller = Poller::new_full(
+            db.clone(),
+            30,
+            dir.path().into(),
+            dir.path().into(),
+            0,
+            selector.clone(),
+        );
+        poller
+            .record_poll_batch(
+                &scope_to_interface(overlapping_interfaces(), "awg0").matched,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        poller.apply_config_mapping_step().await.unwrap();
+        let alice = crate::db::peers::find_by_public_key(&db.pool, "ALICE_KEY=")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(alice.managed_client_name.as_deref(), Some("alice"));
+        // Use a generic filename to ensure the key cache itself is invalidated,
+        // independently of the installer filename ownership check.
+        std::fs::rename(
+            dir.path().join("awg0-client-alice.conf"),
+            dir.path().join("custom.conf"),
+        )
+        .unwrap();
+        poller.apply_config_mapping_step().await.unwrap();
+        let app = crate::web::router_with_lifecycle_lock_dir(
+            db,
+            crate::auth::AuthConfig::disabled(),
+            dir.path().into(),
+            dir.path().into(),
+            dir.path().join("missing-sessions.json"),
+            selector.clone(),
+        );
+        assert_config_exports(&app, alice.id, axum::http::StatusCode::OK).await;
+        changed.store(true, Ordering::SeqCst);
+        selector.resolve_mode().unwrap();
+        assert_config_exports(&app, alice.id, axum::http::StatusCode::NOT_FOUND).await;
+    }
+
+    #[tokio::test]
+    async fn config_mapping_preserves_owned_exports_and_rejects_conflicting_filenames() {
+        for monitored in ["awg0", "awg1"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Database::connect_for_test().await.unwrap();
+            let selector = config_scope_selector(monitored);
+            selector.resolve_mode().unwrap();
+            let poller = Poller::new_full(
+                db.clone(),
+                30,
+                dir.path().into(),
+                dir.path().into(),
+                0,
+                selector.clone(),
+            );
+            let scoped = scope_to_interface(overlapping_interfaces(), monitored).matched;
+            poller.record_poll_batch(&scoped, Utc::now()).await.unwrap();
+            if monitored == "awg1" {
+                sqlx::query("INSERT INTO peers (public_key, allowed_ips, disabled, managed_client_name) VALUES ('OLD_ALICE=', '10.66.66.2/32', 1, 'historical-alice')")
+                    .execute(&db.pool).await.unwrap();
+            }
+            let (key, server, foreign_name) = if monitored == "awg0" {
+                ("ALICE_KEY=", "AWG0_SERVER=", "awg1-client-wrong")
+            } else {
+                ("BOB_KEY=", "AWG1_SERVER=", "awg0-client-wrong")
+            };
+            let path = dir.path().join(format!("{foreign_name}.conf"));
+            std::fs::write(&path, scoped_client_config(server)).unwrap();
+            poller.apply_config_mapping_step().await.unwrap();
+            let row = crate::db::peers::find_by_public_key(&db.pool, key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                row.has_config, 0,
+                "a foreign filename must not override server ownership"
+            );
+
+            std::fs::rename(&path, dir.path().join("custom-client.conf")).unwrap();
+            poller.apply_config_mapping_step().await.unwrap();
+            let row = crate::db::peers::find_by_public_key(&db.pool, key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.has_config, 1);
+            let app = crate::web::router_with_lifecycle_lock_dir(
+                db,
+                crate::auth::AuthConfig::disabled(),
+                dir.path().into(),
+                dir.path().into(),
+                dir.path().join("missing-sessions.json"),
+                selector,
+            );
+            assert_config_exports(&app, row.id, axum::http::StatusCode::OK).await;
+            // A stale DB link must not authorize replacement file contents.
+            std::fs::write(
+                dir.path().join("custom-client.conf"),
+                scoped_client_config("FOREIGN_SERVER="),
+            )
+            .unwrap();
+            assert_config_exports(&app, row.id, axum::http::StatusCode::NOT_FOUND).await;
+            std::fs::write(
+                dir.path().join("custom-client.conf"),
+                scoped_client_config(server),
+            )
+            .unwrap();
+            poller.record_poll_batch(&[], Utc::now()).await.unwrap();
+            assert_config_exports(
+                &app,
+                row.id,
+                if monitored == "awg0" {
+                    axum::http::StatusCode::OK
+                } else {
+                    axum::http::StatusCode::NOT_FOUND
+                },
+            )
+            .await;
+            poller.apply_config_mapping_step().await.unwrap();
+            let row = crate::db::peers::find_by_public_key(&poller.db.pool, key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.has_config, i64::from(monitored == "awg0"));
+            if monitored == "awg1" {
+                let historical =
+                    crate::db::peers::find_by_public_key(&poller.db.pool, "OLD_ALICE=")
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(
+                    historical.managed_client_name.as_deref(),
+                    Some("historical-alice")
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn collect_awg_dump_propagates_success() {

@@ -43,8 +43,9 @@ A shell script like `awg show` gives you a live snapshot of the tunnel.
 - **Background poller** – polls `awg show all dump` every N seconds, keeps
   only the managed interface, stores per-peer traffic snapshots in SQLite and
   keeps the `peers` table current.
-- **Config discovery** – scans `AWG_CONFIG_DIR` for `*.conf` files, correlates
-  each config file with its live peer by public key.
+- **Config discovery** – scans `AWG_CONFIG_DIR` for `*.conf` files, verifies
+  their server public key belongs to the followed interface, then matches
+  client addresses to an unambiguous peer.
 - **AmneziaVPN import links** – peer details offer **Copy Amnezia link** and
   **Open in Amnezia**. Links are generated on demand from the saved client
   config, preserving MTU, AWG 3.x fields, comments, and custom entries. Existing
@@ -277,6 +278,17 @@ unavailable (monitoring-only mode)`, the corresponding controls are hidden, and
 the mode is logged at startup. Use the override to watch a hand-made interface
 next to the installer's one; managing a second interface would need its own
 installer params and is not supported.
+
+Config discovery and all exports (download, QR and `vpn://`) verify the
+client config's `[Peer] PublicKey` against the followed server's public key.
+Installer-style `<interface>-client-<name>.conf` filenames must also name that
+interface. In monitoring-only mode, configs are matched only to its observed
+live peers; exports are unavailable before its first successful observation
+or after a poll reports that interface absent. Managing instances can use
+`SERVER_PUB_KEY` from the installer params while their interface is down,
+including for disabled clients. These checks also apply to old database
+mappings and re-read files, so equal client addresses on different servers
+do not establish config ownership.
 
 See [`.env.example`](.env.example) for a ready-to-copy template.
 

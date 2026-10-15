@@ -22,6 +22,7 @@
 //! in which it records the interface but never changes it, the installer's
 //! interface, or the protocol.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
@@ -118,7 +119,30 @@ pub struct InterfaceSelector {
     /// Interface name pinned by `AWG_INTERFACE`; `None` defers to the params.
     override_name: Option<String>,
     read_params: ParamsReader,
-    last_mode: Arc<RwLock<Option<PanelMode>>>,
+    last_mode: Arc<RwLock<Option<ResolvedInterface>>>,
+}
+
+#[derive(Clone)]
+struct ResolvedInterface {
+    mode: PanelMode,
+    installer_public_key: Option<String>,
+    observed: Option<AwgInterface>,
+}
+
+/// Evidence tying client files to the selected server, shared by discovery
+/// and exports. Monitoring requires a successful observation of that server.
+pub(crate) struct ConfigScope {
+    pub mode: PanelMode,
+    pub server_public_key: String,
+    monitored_peer_keys: Option<HashSet<String>>,
+}
+
+impl ConfigScope {
+    pub fn permits_peer(&self, public_key: &str) -> bool {
+        self.monitored_peer_keys
+            .as_ref()
+            .map_or(true, |keys| keys.contains(public_key))
+    }
 }
 
 impl fmt::Debug for InterfaceSelector {
@@ -197,8 +221,25 @@ impl InterfaceSelector {
     /// override the params are required; with one, unreadable params merely
     /// mean monitoring-only mode.
     pub fn resolve_mode(&self) -> Result<PanelMode, ManagedInterfaceError> {
-        let mode = self.classify((self.read_params)())?;
-        self.remember(mode.clone());
+        let params = (self.read_params)();
+        let installer_public_key = params
+            .as_ref()
+            .ok()
+            .and_then(|content| parse_params(content).ok())
+            .map(|params| params.server_pub_key);
+        let mode = self.classify(params)?;
+        let mut guard = self.last_mode.write().unwrap_or_else(|e| e.into_inner());
+        let observed = guard
+            .as_ref()
+            .filter(|previous| {
+                previous.mode == mode && previous.installer_public_key == installer_public_key
+            })
+            .and_then(|previous| previous.observed.clone());
+        *guard = Some(ResolvedInterface {
+            mode: mode.clone(),
+            installer_public_key,
+            observed,
+        });
         Ok(mode)
     }
 
@@ -223,16 +264,58 @@ impl InterfaceSelector {
     /// The last successfully resolved mode, if any.
     pub fn last_mode(&self) -> Option<PanelMode> {
         match self.last_mode.read() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
+            Ok(guard) => guard.as_ref().map(|resolved| resolved.mode.clone()),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .as_ref()
+                .map(|resolved| resolved.mode.clone()),
         }
     }
 
-    fn remember(&self, mode: PanelMode) {
-        match self.last_mode.write() {
-            Ok(mut guard) => *guard = Some(mode),
-            Err(poisoned) => *poisoned.into_inner() = Some(mode),
+    /// Replace the live evidence after each successful dump, including an
+    /// empty dump: an absent monitored interface must revoke old exports.
+    pub(crate) fn observe_interfaces(&self, interfaces: &[AwgInterface]) {
+        let mut guard = self.last_mode.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(resolved) = guard.as_mut() {
+            resolved.observed = interfaces
+                .iter()
+                .find(|iface| iface.name == resolved.mode.interface())
+                .cloned();
         }
+    }
+
+    pub(crate) async fn config_scope(&self) -> Result<Option<ConfigScope>, ManagedInterfaceError> {
+        self.current_mode().await?;
+        let guard = self.last_mode.read().unwrap_or_else(|e| e.into_inner());
+        let Some(resolved) = guard.as_ref() else {
+            return Ok(None);
+        };
+        let key = resolved
+            .observed
+            .as_ref()
+            .map(|iface| &iface.public_key.0)
+            .or_else(|| {
+                resolved
+                    .mode
+                    .is_managing()
+                    .then_some(resolved.installer_public_key.as_ref())
+                    .flatten()
+            });
+        let Some(key) = key.filter(|key| !key.is_empty() && key.as_str() != "(none)") else {
+            return Ok(None);
+        };
+        Ok(Some(ConfigScope {
+            mode: resolved.mode.clone(),
+            server_public_key: key.clone(),
+            monitored_peer_keys: (!resolved.mode.is_managing()).then(|| {
+                resolved
+                    .observed
+                    .iter()
+                    .flat_map(|iface| &iface.peers)
+                    .map(|peer| peer.public_key.0.clone())
+                    .collect()
+            }),
+        }))
     }
 
     fn classify(

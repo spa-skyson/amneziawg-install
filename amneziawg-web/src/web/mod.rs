@@ -1190,7 +1190,10 @@ pub fn router_with_proxy_sessions_file(
         config_dir.clone(),
         config_dir,
         proxy_sessions_file,
-        InterfaceSelector::from_params(),
+        InterfaceSelector::from_params().with_params_reader(|| {
+            Ok(crate::managed_interface::test_params("awg0")
+                .replace("SERVER_PUB_KEY='PUB'", "SERVER_PUB_KEY='SERVER_KEY='"))
+        }),
     )
 }
 
@@ -1958,6 +1961,7 @@ async fn read_file_nofollow(path: &std::path::Path) -> std::io::Result<String> {
 ///
 /// Returns `Ok((content, config_path))` on success, or an error `Response`
 /// that the caller can return directly.
+#[allow(clippy::result_large_err)] // Shared handlers return this Axum response directly.
 async fn read_validated_config(
     state: &AppState,
     peer_id: i64,
@@ -2055,6 +2059,26 @@ async fn read_validated_config(
                 .into_response())
         }
     };
+
+    // Database mappings may predate interface scoping or a file replacement.
+    // Recheck the actual bytes for every export, including before the first
+    // poll. A monitoring-only instance has no ownership evidence while its
+    // interface is absent; managing instances can use the installer params.
+    let scope = state.interface.config_scope().await.ok().flatten();
+    let config = crate::config_store::ClientConfig::from_content(config_path.clone(), &content);
+    if !scope.as_ref().is_some_and(|scope| {
+        config.belongs_to(scope)
+            && scope.permits_peer(&peer.public_key)
+            && config.matches_addresses(&peer.allowed_ips)
+    }) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "config ownership could not be verified for this peer"
+            })),
+        )
+            .into_response());
+    }
 
     Ok((content, config_path))
 }
@@ -3589,7 +3613,9 @@ async fn refresh_peer_state_after_lifecycle(state: &AppState) {
     if let Err(e) = crate::poller::sync_peers_from_awg(&state.db, &state.interface).await {
         tracing::warn!(error = %e, "post-lifecycle peer sync failed");
     }
-    if let Err(e) = crate::poller::rescan_configs(&state.db, &state.config_dir).await {
+    if let Err(e) =
+        crate::poller::rescan_configs(&state.db, &state.config_dir, &state.interface).await
+    {
         tracing::warn!(error = %e, "post-lifecycle config rescan failed");
     }
 }
@@ -8120,7 +8146,11 @@ mod tests {
         // Create a temp config file inside the config directory.
         let dir = tempfile::tempdir().unwrap();
         let conf_path = dir.path().join("test-client.conf");
-        std::fs::write(&conf_path, "[Interface]\nAddress = 10.0.0.2/32\n").unwrap();
+        std::fs::write(
+            &conf_path,
+            "[Interface]\nAddress = 10.8.0.2/32\n[Peer]\nPublicKey = SERVER_KEY=\n",
+        )
+        .unwrap();
 
         // Map the config to the peer.
         crate::db::peers::apply_config_mapping(
@@ -8179,7 +8209,7 @@ mod tests {
             .unwrap();
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.contains("[Interface]"));
-        assert!(text.contains("10.0.0.2/32"));
+        assert!(text.contains("10.8.0.2/32"));
     }
 
     #[tokio::test]
@@ -8634,7 +8664,7 @@ mod tests {
             "HeaderProtectionKey = HEADER_KEY=\r\nRandomTrailers = on\r\nDisableCookies = off\r\nMTU = 1280\r\n",
         ] {
             let content = format!(
-                "# café — телефон {}\r\n[Interface]\r\nPrivateKey = PRIVATE_KEY=\r\nAddress = 10.0.0.2/32, fd42::2/128\r\nDNS = 1.1.1.1\r\nS1 = 15\r\nS2 = 20\r\nS3 = 25\r\nS4 = 30\r\n{extra}CustomField = retain-me\r\n[Peer]\r\nPublicKey = SERVER_KEY=\r\nPresharedKey = PSK=\r\nAllowedIPs = 0.0.0.0/0, ::/0\r\nEndpoint = [2001:db8::1]:51820\r\n",
+                "# café — телефон {}\r\n[Interface]\r\nPrivateKey = PRIVATE_KEY=\r\nAddress = 10.8.0.2/32, fd42::2/128\r\nDNS = 1.1.1.1\r\nS1 = 15\r\nS2 = 20\r\nS3 = 25\r\nS4 = 30\r\n{extra}CustomField = retain-me\r\n[Peer]\r\nPublicKey = SERVER_KEY=\r\nPresharedKey = PSK=\r\nAllowedIPs = 0.0.0.0/0, ::/0\r\nEndpoint = [2001:db8::1]:51820\r\n",
                 "x".repeat(65_536)
             );
             let (app, dir, id) = vpn_uri_fixture(&content).await;
@@ -8712,7 +8742,7 @@ mod tests {
         let id = insert_peer(&db, "AUTH_VPN_KEY=", None).await;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("client.conf");
-        std::fs::write(&path, "[Interface]\nPrivateKey = TEST_KEY\n").unwrap();
+        std::fs::write(&path, "[Interface]\nPrivateKey = TEST_KEY\nAddress = 10.8.0.2/32\n[Peer]\nPublicKey = SERVER_KEY=\n").unwrap();
         crate::db::peers::apply_config_mapping(
             &db.pool,
             "AUTH_VPN_KEY=",
@@ -9979,7 +10009,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("awg0-client-alice.conf"),
-            "[Interface]\nAddress = 10.66.66.100/32, fd42:42:42::100/128\n",
+            "[Interface]\nAddress = 10.66.66.100/32, fd42:42:42::100/128\n[Peer]\nPublicKey = SERVER_KEY=\n",
         )
         .expect("write client config");
         let app = test_router_with_config_dir(db.clone(), dir.path().to_path_buf());
@@ -10060,7 +10090,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("awg0-client-bob.conf"),
-            "[Interface]\nAddress = 10.66.66.250/32, fd42:42:42::250/128\n",
+            "[Interface]\nAddress = 10.66.66.250/32, fd42:42:42::250/128\n[Peer]\nPublicKey = SERVER_KEY=\n",
         )
         .expect("write client config");
         let app = test_router_with_config_dir(db.clone(), dir.path().to_path_buf());
@@ -10416,7 +10446,7 @@ mod tests {
         // Create a temp config file inside the config directory.
         let dir = tempfile::tempdir().unwrap();
         let conf_path = dir.path().join("test-qr.conf");
-        let config = "# Raw QR payload: café\r\n[Interface]\r\nAddress = 10.0.0.2/32\r\nMTU = 1380\r\n\r\n[Peer]\r\nAllowedIPs = 0.0.0.0/0, ::/0";
+        let config = "# Raw QR payload: café\r\n[Interface]\r\nAddress = 10.8.0.2/32\r\nMTU = 1380\r\n\r\n[Peer]\r\nPublicKey = SERVER_KEY=\r\nAllowedIPs = 0.0.0.0/0, ::/0";
         std::fs::write(&conf_path, config).unwrap();
 
         crate::db::peers::apply_config_mapping(
@@ -10489,7 +10519,10 @@ mod tests {
         // Create a config file that exceeds QR code data capacity.
         let dir = tempfile::tempdir().unwrap();
         let conf_path = dir.path().join("big-qr.conf");
-        let big_content = "A".repeat(5000);
+        let big_content = format!(
+            "[Interface]\nAddress = 10.8.0.2/32\n[Peer]\nPublicKey = SERVER_KEY=\n# {}",
+            "A".repeat(5000)
+        );
         std::fs::write(&conf_path, &big_content).unwrap();
 
         crate::db::peers::apply_config_mapping(
