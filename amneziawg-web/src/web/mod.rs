@@ -2231,6 +2231,15 @@ async fn patch_peer(
         }
     };
 
+    // Enabling, disabling and expiring peers act on the interface and the
+    // installer's lifecycle; a monitoring-only instance refuses them while
+    // still accepting name and comment edits.
+    if body.disabled.is_some() || body.expiration_days.is_some() {
+        if let Some(reason) = management_unavailable_reason(&state).await {
+            return Ok(management_unavailable_json(&reason));
+        }
+    }
+
     // Merge: if the caller provided a field, normalise it; otherwise keep the
     // existing DB value.
     let new_display_name = match body.display_name {
@@ -2421,6 +2430,7 @@ async fn page_peer_list(
                 .as_deref()
                 .and_then(imitation_notice_message)
         });
+    let monitoring_only = monitoring_only_notice(&state).await;
     Ok(Html(render_peer_list(
         &peers,
         &csrf,
@@ -2428,6 +2438,7 @@ async fn page_peer_list(
         &proxy_sessions,
         notice,
         show_archived,
+        monitoring_only.as_deref(),
     ))
     .into_response())
 }
@@ -2453,7 +2464,14 @@ async fn page_peer_detail(
             let mut dto = peer_row_to_detail(peer_row, snapshots);
             annotate_peer_detail_with_proxy_remote(&mut dto, &proxy_sessions_status(&state).await);
             let csrf = session_csrf_from_headers(&state, &headers);
-            Ok(Html(render_peer_detail(&dto, &csrf, &events)).into_response())
+            let monitoring_only = monitoring_only_notice(&state).await;
+            Ok(Html(render_peer_detail(
+                &dto,
+                &csrf,
+                &events,
+                monitoring_only.as_deref(),
+            ))
+            .into_response())
         }
     }
 }
@@ -2619,6 +2637,39 @@ async fn post_peer_edit(
                 .into_response());
         }
     };
+
+    // A monitoring-only instance still accepts name and comment edits, but
+    // refuses expiration and enable/disable changes, which act on the
+    // interface and the installer's lifecycle.  Its edit form carries the
+    // current disabled state in a hidden field, so a plain save never differs.
+    if let Some(reason) = management_unavailable_reason(&state).await {
+        let submitted_disabled = form.disabled.as_deref() == Some("1");
+        let expiration_requested = form
+            .expiration_days
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+        if expiration_requested || submitted_disabled != (existing.disabled != 0) {
+            let public_key = existing.public_key.clone();
+            let snapshots =
+                crate::db::peers::find_snapshots(&state.db.pool, &public_key, 50).await?;
+            let events = list_events(&state.db.pool, Some(id), None, 20).await?;
+            let mut dto = peer_row_to_detail(existing, snapshots);
+            annotate_peer_detail_with_proxy_remote(&mut dto, &proxy_sessions_status(&state).await);
+            let csrf = session_csrf_from_headers(&state, &headers);
+            let message = format!("Save failed: {reason}");
+            return Ok((
+                StatusCode::CONFLICT,
+                Html(render_peer_detail_with_error(
+                    &dto,
+                    &csrf,
+                    &events,
+                    &message,
+                    Some(&reason),
+                )),
+            )
+                .into_response());
+        }
+    }
 
     let display_name = form
         .display_name
@@ -2901,6 +2952,9 @@ async fn post_imitation_change(
         Ok(settings) => settings,
         Err(message) => return Ok((StatusCode::BAD_REQUEST, message).into_response()),
     };
+    if let Some(reason) = management_unavailable_reason(state).await {
+        return Ok((StatusCode::CONFLICT, reason).into_response());
+    }
     let detail = serde_json::to_string(&settings)?;
     let result = tokio::task::spawn_blocking(move || apply(&settings)).await;
     *state.system_versions_cache.write().await = None;
@@ -2948,6 +3002,9 @@ async fn post_protocol_change(
             "Confirm that all client configurations will be replaced.",
         )
             .into_response());
+    }
+    if let Some(reason) = management_unavailable_reason(state).await {
+        return Ok((StatusCode::CONFLICT, reason).into_response());
     }
 
     let result =
@@ -3054,6 +3111,10 @@ async fn api_create_user(
 
     #[cfg(not(test))]
     let _ = headers;
+
+    if let Some(reason) = management_unavailable_reason(&state).await {
+        return Ok(management_unavailable_json(&reason));
+    }
 
     let name = body.name.trim().to_string();
     let comment = body.comment.as_deref().and_then(normalize_comment);
@@ -3169,6 +3230,10 @@ async fn api_remove_user(
         }
     };
 
+    if let Some(reason) = management_unavailable_reason(&state).await {
+        return Ok(management_unavailable_json(&reason));
+    }
+
     // Prefer the stable identity persisted at creation/removal start. Migrated
     // rows fall back to validated config discovery metadata while it exists.
     let client_name = match managed_client_name_for_lifecycle(&peer) {
@@ -3244,7 +3309,7 @@ async fn post_add_user_form(
         let message = create_user_diagnostic_message(&e);
         let status = system_status(&state);
         return Ok(Html(render_peer_list_with_error(
-            &peers, &csrf, &status, &message,
+            &peers, &csrf, &status, &message, None,
         ))
         .into_response());
     }
@@ -3258,6 +3323,21 @@ async fn post_add_user_form(
         if !validate_form_csrf(&state, cookie_header, submitted) {
             return Ok(StatusCode::FORBIDDEN.into_response());
         }
+    }
+
+    if let Some(reason) = management_unavailable_reason(&state).await {
+        let rows = crate::db::peers::list_visible(&state.db.pool).await?;
+        let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
+        let csrf = session_csrf_from_headers(&state, &headers);
+        let status = system_status(&state);
+        return Ok(Html(render_peer_list_with_error(
+            &peers,
+            &csrf,
+            &status,
+            &reason,
+            Some(&reason),
+        ))
+        .into_response());
     }
 
     let name = form.name.trim().to_string();
@@ -3277,7 +3357,7 @@ async fn post_add_user_form(
             let csrf = session_csrf_from_headers(&state, &headers);
             let status = system_status(&state);
             return Ok(Html(render_peer_list_with_error(
-                &peers, &csrf, &status, &message,
+                &peers, &csrf, &status, &message, None,
             ))
             .into_response());
         }
@@ -3290,7 +3370,7 @@ async fn post_add_user_form(
             let csrf = session_csrf_from_headers(&state, &headers);
             let status = system_status(&state);
             return Ok(Html(render_peer_list_with_error(
-                &peers, &csrf, &status, &message,
+                &peers, &csrf, &status, &message, None,
             ))
             .into_response());
         }
@@ -3326,14 +3406,20 @@ async fn post_add_user_form(
             let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
             let status = system_status(&state);
-            Ok(Html(render_peer_list_with_error(&peers, &csrf, &status, &msg)).into_response())
+            Ok(Html(render_peer_list_with_error(
+                &peers, &csrf, &status, &msg, None,
+            ))
+            .into_response())
         }
         Err(crate::admin::client_manager::CreateClientError::InvalidIp(ref msg)) => {
             let rows = crate::db::peers::list_visible(&state.db.pool).await?;
             let peers: Vec<PeerSummaryDto> = rows.into_iter().map(peer_row_to_summary).collect();
             let csrf = session_csrf_from_headers(&state, &headers);
             let status = system_status(&state);
-            Ok(Html(render_peer_list_with_error(&peers, &csrf, &status, msg)).into_response())
+            Ok(Html(render_peer_list_with_error(
+                &peers, &csrf, &status, msg, None,
+            ))
+            .into_response())
         }
         Err(crate::admin::client_manager::CreateClientError::IpInUse(ref ip)) => {
             let rows = crate::db::peers::list_visible(&state.db.pool).await?;
@@ -3342,7 +3428,7 @@ async fn post_add_user_form(
             let message = format!("IP address already in use: {ip}");
             let status = system_status(&state);
             Ok(Html(render_peer_list_with_error(
-                &peers, &csrf, &status, &message,
+                &peers, &csrf, &status, &message, None,
             ))
             .into_response())
         }
@@ -3353,7 +3439,10 @@ async fn post_add_user_form(
             let message =
                 "Another add/remove operation is already in progress; please try again later.";
             let status = system_status(&state);
-            Ok(Html(render_peer_list_with_error(&peers, &csrf, &status, message)).into_response())
+            Ok(Html(render_peer_list_with_error(
+                &peers, &csrf, &status, message, None,
+            ))
+            .into_response())
         }
         Err(e) => {
             tracing::error!(error = %e, "failed to create user via HTML form");
@@ -3363,7 +3452,7 @@ async fn post_add_user_form(
             let message = create_user_diagnostic_message(&e);
             let status = system_status(&state);
             Ok(Html(render_peer_list_with_error(
-                &peers, &csrf, &status, &message,
+                &peers, &csrf, &status, &message, None,
             ))
             .into_response())
         }
@@ -3411,6 +3500,27 @@ async fn post_remove_user_form(
         }
     };
 
+    if let Some(reason) = management_unavailable_reason(&state).await {
+        let public_key = peer.public_key.clone();
+        let snapshots = crate::db::peers::find_snapshots(&state.db.pool, &public_key, 50).await?;
+        let events = list_events(&state.db.pool, Some(id), None, 20).await?;
+        let mut dto = peer_row_to_detail(peer, snapshots);
+        annotate_peer_detail_with_proxy_remote(&mut dto, &proxy_sessions_status(&state).await);
+        let csrf = session_csrf_from_headers(&state, &headers);
+        let message = format!("Remove failed: {reason}");
+        return Ok((
+            StatusCode::CONFLICT,
+            Html(render_peer_detail_with_error(
+                &dto,
+                &csrf,
+                &events,
+                &message,
+                Some(&reason),
+            )),
+        )
+            .into_response());
+    }
+
     if let Err(e) = crate::admin::script_bridge::validate_client_name(&client_name) {
         let public_key = peer.public_key.clone();
         let snapshots = crate::db::peers::find_snapshots(&state.db.pool, &public_key, 50).await?;
@@ -3420,7 +3530,7 @@ async fn post_remove_user_form(
         let csrf = session_csrf_from_headers(&state, &headers);
         let message = format!("Remove failed: peer is not managed by installer: {e}");
         return Ok(Html(render_peer_detail_with_error(
-            &dto, &csrf, &events, &message,
+            &dto, &csrf, &events, &message, None,
         ))
         .into_response());
     }
@@ -3463,7 +3573,10 @@ async fn post_remove_user_form(
             let mut dto = peer_row_to_detail(peer_row, snapshots);
             annotate_peer_detail_with_proxy_remote(&mut dto, &proxy_sessions_status(&state).await);
             let csrf = session_csrf_from_headers(&state, &headers);
-            Ok(Html(render_peer_detail_with_error(&dto, &csrf, &events, message)).into_response())
+            Ok(Html(render_peer_detail_with_error(
+                &dto, &csrf, &events, message, None,
+            ))
+            .into_response())
         }
     }
 }
@@ -3481,6 +3594,61 @@ async fn refresh_peer_state_after_lifecycle(state: &AppState) {
     }
 }
 
+// ── Panel mode ───────────────────────────────────────────────────────────────
+
+/// Why a management request must be refused, resolved fresh for a mutation.
+///
+/// Only an `AWG_INTERFACE` override can put the panel into monitoring-only
+/// mode, so without one this never contacts the privileged helper.  A fresh
+/// resolution (one `read-params` call) keeps a mutation honest even when the
+/// poller's cached view is up to a cycle old.
+async fn management_unavailable_reason(state: &AppState) -> Option<String> {
+    state.interface.override_name()?;
+    match state.interface.resolve_mode_off_thread().await {
+        Ok(mode) => mode.management_unavailable(),
+        Err(e) => Some(format!("cannot determine the managed AWG interface: {e}")),
+    }
+}
+
+/// Monitoring-only explanation for page rendering, from the mode the poller
+/// resolves every cycle (resolved on demand only before its first cycle).
+async fn monitoring_only_notice(state: &AppState) -> Option<String> {
+    state.interface.override_name()?;
+    match state.interface.current_mode().await {
+        Ok(mode) => mode.management_unavailable(),
+        Err(e) => Some(format!("cannot determine the managed AWG interface: {e}")),
+    }
+}
+
+fn management_unavailable_json(reason: &str) -> Response {
+    (StatusCode::CONFLICT, Json(json!({ "error": reason }))).into_response()
+}
+
+/// Interfaces from which a disabled peer must be removed: the managed one,
+/// and only when it currently carries `public_key`.
+fn peer_removal_targets(
+    interfaces: Vec<crate::awg::AwgInterface>,
+    managed: &str,
+    public_key: &str,
+) -> Vec<String> {
+    scope_to_interface(interfaces, managed)
+        .matched
+        .into_iter()
+        .filter(|iface| iface.peers.iter().any(|p| p.public_key.0 == public_key))
+        .map(|iface| iface.name)
+        .collect()
+}
+
+/// Interfaces to reconcile from disk after a peer is re-enabled: the managed
+/// one, and only while it is up.
+fn interface_sync_targets(interfaces: Vec<crate::awg::AwgInterface>, managed: &str) -> Vec<String> {
+    scope_to_interface(interfaces, managed)
+        .matched
+        .into_iter()
+        .map(|iface| iface.name)
+        .collect()
+}
+
 // ── AWG enforcement helpers ───────────────────────────────────────────────────
 
 /// Best-effort immediate removal of a peer from the managed AWG interface.
@@ -3495,8 +3663,8 @@ fn remove_peer_from_interface(interface: &InterfaceSelector, public_key: &str) {
     let interface = interface.clone();
     let pk = public_key.to_owned();
     tokio::task::spawn_blocking(move || {
-        let managed = match interface.resolve() {
-            Ok(name) => name,
+        let mode = match interface.resolve_mode() {
+            Ok(mode) => mode,
             Err(e) => {
                 tracing::warn!(
                     public_key = %pk,
@@ -3506,6 +3674,14 @@ fn remove_peer_from_interface(interface: &InterfaceSelector, public_key: &str) {
                 return;
             }
         };
+        if !mode.is_managing() {
+            tracing::warn!(
+                public_key = %pk,
+                interface = %mode.interface(),
+                "monitoring-only mode – peer not removed from the interface"
+            );
+            return;
+        }
         let interfaces = match crate::awg::show_all_dump() {
             Ok(ifaces) => ifaces,
             Err(e) => {
@@ -3518,24 +3694,22 @@ fn remove_peer_from_interface(interface: &InterfaceSelector, public_key: &str) {
             }
         };
 
-        for iface in &scope_to_interface(interfaces, &managed).matched {
-            if iface.peers.iter().any(|p| p.public_key.0 == pk) {
-                match crate::awg::remove_peer(&iface.name, &pk) {
-                    Ok(()) => {
-                        tracing::info!(
-                            interface = %iface.name,
-                            public_key = %pk,
-                            "disabled peer removed from interface"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            interface = %iface.name,
-                            public_key = %pk,
-                            error = %e,
-                            "failed to remove disabled peer – poller will retry"
-                        );
-                    }
+        for iface_name in peer_removal_targets(interfaces, mode.interface(), &pk) {
+            match crate::awg::remove_peer(&iface_name, &pk) {
+                Ok(()) => {
+                    tracing::info!(
+                        interface = %iface_name,
+                        public_key = %pk,
+                        "disabled peer removed from interface"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        interface = %iface_name,
+                        public_key = %pk,
+                        error = %e,
+                        "failed to remove disabled peer – poller will retry"
+                    );
                 }
             }
         }
@@ -3586,8 +3760,8 @@ fn restore_peer_to_interface(
 ) {
     let interface = interface.clone();
     tokio::task::spawn_blocking(move || {
-        let managed = match interface.resolve() {
-            Ok(name) => name,
+        let mode = match interface.resolve_mode() {
+            Ok(mode) => mode,
             Err(e) => {
                 tracing::warn!(
                     error = %e,
@@ -3596,6 +3770,13 @@ fn restore_peer_to_interface(
                 return;
             }
         };
+        if !mode.is_managing() {
+            tracing::warn!(
+                interface = %mode.interface(),
+                "monitoring-only mode – interface not reconciled after peer restore"
+            );
+            return;
+        }
         let interfaces = match crate::awg::show_all_dump() {
             Ok(ifaces) => ifaces,
             Err(e) => {
@@ -3607,17 +3788,17 @@ fn restore_peer_to_interface(
             }
         };
 
-        for iface in &scope_to_interface(interfaces, &managed).matched {
-            match crate::awg::sync_interface(&iface.name, &disabled_keys) {
+        for iface_name in interface_sync_targets(interfaces, mode.interface()) {
+            match crate::awg::sync_interface(&iface_name, &disabled_keys) {
                 Ok(()) => {
                     tracing::info!(
-                        interface = %iface.name,
+                        interface = %iface_name,
                         "interface synced from disk after attempting peer restore"
                     );
                 }
                 Err(e) => {
                     tracing::warn!(
-                        interface = %iface.name,
+                        interface = %iface_name,
                         error = %e,
                         "failed to sync interface – peer will be restored on next AWG restart"
                     );
@@ -4146,6 +4327,7 @@ fn render_peer_list(
     proxy_sessions: &ProxySessionsDto,
     notice: Option<&str>,
     show_archived: bool,
+    monitoring_only: Option<&str>,
 ) -> String {
     render_peer_list_inner(
         peers,
@@ -4155,6 +4337,7 @@ fn render_peer_list(
         notice,
         None,
         show_archived,
+        monitoring_only,
     )
 }
 
@@ -4163,6 +4346,7 @@ fn render_peer_list_with_error(
     csrf_token: &str,
     system_status: &SystemStatusDto,
     error: &str,
+    monitoring_only: Option<&str>,
 ) -> String {
     render_peer_list_inner(
         peers,
@@ -4172,6 +4356,14 @@ fn render_peer_list_with_error(
         None,
         Some(error),
         false,
+        monitoring_only,
+    )
+}
+
+fn render_monitoring_only_banner(reason: &str) -> String {
+    format!(
+        "<p class=\"creation-warning monitoring-only\" role=\"status\"><strong>Monitoring-only mode.</strong> {}</p>\n",
+        esc(reason)
     )
 }
 
@@ -4229,6 +4421,7 @@ fn render_protocol_controls(csrf_token: &str) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_peer_list_inner(
     peers: &[PeerSummaryDto],
     csrf_token: &str,
@@ -4237,6 +4430,7 @@ fn render_peer_list_inner(
     notice: Option<&str>,
     error: Option<&str>,
     show_archived: bool,
+    monitoring_only: Option<&str>,
 ) -> String {
     let mut buf = html_head("AmneziaWG – Peers");
     let now = Utc::now();
@@ -4265,8 +4459,15 @@ fn render_peer_list_inner(
             esc(notice)
         ));
     }
-    buf.push_str(&render_protocol_controls(csrf_token));
-    buf.push_str(&render_imitation_controls(csrf_token));
+    if let Some(reason) = monitoring_only {
+        buf.push_str(&render_monitoring_only_banner(reason));
+        if let Some(err) = error {
+            buf.push_str(&format!("<p class=\"error\">{}</p>\n", esc(err)));
+        }
+    } else {
+        buf.push_str(&render_protocol_controls(csrf_token));
+        buf.push_str(&render_imitation_controls(csrf_token));
+    }
 
     if peers.is_empty() {
         buf.push_str("<p>No peers found. The poller may not have run yet.</p>\n");
@@ -4319,6 +4520,12 @@ fn render_peer_list_inner(
 
     if let Some(proxy_sessions) = proxy_sessions {
         buf.push_str(&render_proxy_sessions(proxy_sessions));
+    }
+
+    if monitoring_only.is_some() {
+        // Client creation is unavailable; the banner above says why.
+        buf.push_str("</body></html>");
+        return buf;
     }
 
     let add_user_open = if error.is_some() { " open" } else { "" };
@@ -4477,8 +4684,9 @@ fn render_peer_detail(
     dto: &PeerDetailDto,
     csrf_token: &str,
     events: &[crate::db::events::EventRow],
+    monitoring_only: Option<&str>,
 ) -> String {
-    render_peer_detail_inner(dto, csrf_token, events, None)
+    render_peer_detail_inner(dto, csrf_token, events, None, monitoring_only)
 }
 
 fn render_peer_detail_with_error(
@@ -4486,8 +4694,9 @@ fn render_peer_detail_with_error(
     csrf_token: &str,
     events: &[crate::db::events::EventRow],
     error: &str,
+    monitoring_only: Option<&str>,
 ) -> String {
-    render_peer_detail_inner(dto, csrf_token, events, Some(error))
+    render_peer_detail_inner(dto, csrf_token, events, Some(error), monitoring_only)
 }
 
 fn render_peer_detail_inner(
@@ -4495,12 +4704,16 @@ fn render_peer_detail_inner(
     csrf_token: &str,
     events: &[crate::db::events::EventRow],
     error: Option<&str>,
+    monitoring_only: Option<&str>,
 ) -> String {
     let mut buf = html_head(&format!("Peer – {}", dto.name));
     let now = Utc::now();
     buf.push_str(&nav_bar(csrf_token));
     if let Some(err) = error {
         buf.push_str(&format!("<p class=\"error\">{}</p>\n", esc(err)));
+    }
+    if let Some(reason) = monitoring_only {
+        buf.push_str(&render_monitoring_only_banner(reason));
     }
     buf.push_str(&format!(
         "<a class=\"back\" href=\"/\">&larr; All peers</a>\n\
@@ -4593,21 +4806,20 @@ fn render_peer_detail_inner(
         buf.push_str(include_str!("vpn_uri.html"));
     }
 
-    // Edit form
+    // Edit form.  Expiration and enable/disable act on the interface and the
+    // installer's lifecycle, so a monitoring-only instance only offers the
+    // name and comment fields and round-trips the current disabled state.
     let current_display_name = dto.display_name.as_deref().unwrap_or("");
     let current_comment = dto.comment.as_deref().unwrap_or("");
-    buf.push_str(&format!(
-        r#"<div class="edit-form">
-<h2>Edit peer</h2>
-<form method="POST" action="/peers/{id}">
-  <input type="hidden" name="csrf_token" value="{csrf}">
-  <label for="display_name">Display name</label>
-  <input type="text" id="display_name" name="display_name"
-         value="{dn}" maxlength="128" placeholder="e.g. Ivan iPhone">
-  <label for="comment">Comment</label>
-  <textarea id="comment" name="comment" maxlength="512"
-            placeholder="Optional note about this peer">{cm}</textarea>
-  <label for="expiration_days">Change lifetime in days</label>
+    let lifecycle_controls = if monitoring_only.is_some() {
+        if dto.disabled {
+            "  <input type=\"hidden\" name=\"disabled\" value=\"1\">\n".to_string()
+        } else {
+            String::new()
+        }
+    } else {
+        format!(
+            r#"  <label for="expiration_days">Change lifetime in days</label>
   <input type="number" id="expiration_days" name="expiration_days"
          min="0" max="36500" step="1" list="edit_expiration_lifetime_presets"
          placeholder="Leave unchanged">
@@ -4623,7 +4835,23 @@ fn render_peer_detail_inner(
   <label style="margin-top:.75rem;display:flex;align-items:center;gap:.4rem;font-weight:bold">
     <input type="checkbox" name="disabled" value="1"{disabled_checked}> Disabled
   </label>
-  <button type="submit">Save</button>
+"#,
+            expiration_status = esc(&dto.expiration_status),
+            disabled_checked = if dto.disabled { " checked" } else { "" },
+        )
+    };
+    buf.push_str(&format!(
+        r#"<div class="edit-form">
+<h2>Edit peer</h2>
+<form method="POST" action="/peers/{id}">
+  <input type="hidden" name="csrf_token" value="{csrf}">
+  <label for="display_name">Display name</label>
+  <input type="text" id="display_name" name="display_name"
+         value="{dn}" maxlength="128" placeholder="e.g. Ivan iPhone">
+  <label for="comment">Comment</label>
+  <textarea id="comment" name="comment" maxlength="512"
+            placeholder="Optional note about this peer">{cm}</textarea>
+{lifecycle_controls}  <button type="submit">Save</button>
 </form>
 </div>
 "#,
@@ -4631,8 +4859,7 @@ fn render_peer_detail_inner(
         csrf = esc(csrf_token),
         dn = esc(current_display_name),
         cm = esc(current_comment),
-        expiration_status = esc(&dto.expiration_status),
-        disabled_checked = if dto.disabled { " checked" } else { "" },
+        lifecycle_controls = lifecycle_controls,
     ));
 
     // Forget-data is intentionally separate from managed-user removal. It is
@@ -4662,7 +4889,11 @@ Audit-log entries are retained and may still contain earlier values.</p>
 
     // Keep the retry action available after a partial removal clears transient
     // config discovery metadata; managed_client_name is the durable identity.
-    if let Some(ref managed_name) = dto.managed_client_name {
+    if let Some(managed_name) = dto
+        .managed_client_name
+        .as_ref()
+        .filter(|_| monitoring_only.is_none())
+    {
         buf.push_str(&format!(
             r#"<div class="edit-form" style="margin-top:1.5rem;border-color:#c00">
 <h2 style="color:#c00">Remove user</h2>
@@ -9253,6 +9484,287 @@ mod tests {
     }
 
     // ── API user lifecycle tests ─────────────────────────────────────────
+
+    // ── Monitoring-only mode ────────────────────────────────────────────────
+
+    fn monitoring_only_selector() -> InterfaceSelector {
+        InterfaceSelector::from_override(Some("awg1"))
+            .expect("valid override")
+            .with_params_reader(|| Ok(crate::managed_interface::test_params("awg0")))
+    }
+
+    fn managing_override_selector() -> InterfaceSelector {
+        InterfaceSelector::from_override(Some("awg0"))
+            .expect("valid override")
+            .with_params_reader(|| Ok(crate::managed_interface::test_params("awg0")))
+    }
+
+    fn test_router_with_interface(db: Database, interface: InterfaceSelector) -> Router {
+        router_with_lifecycle_lock_dir(
+            db,
+            AuthConfig::disabled(),
+            PathBuf::from("/tmp/test-configs"),
+            PathBuf::from("/tmp/test-configs"),
+            missing_proxy_sessions_file(),
+            interface,
+        )
+    }
+
+    async fn insert_managed_peer(db: &Database, public_key: &str, name: &str) -> i64 {
+        let id = insert_peer(db, public_key, Some(name)).await;
+        sqlx::query(
+            "UPDATE peers SET has_config = 1, friendly_name = ?, config_name = ?, \
+             managed_client_name = ? WHERE id = ?",
+        )
+        .bind(name)
+        .bind(format!("awg0-client-{name}"))
+        .bind(name)
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .expect("link managed config");
+        id
+    }
+
+    async fn monitoring_body(response: axum::response::Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    async fn monitoring_get(app: &Router, uri: &str) -> String {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        monitoring_body(response).await
+    }
+
+    async fn monitoring_post(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        content_type: &str,
+        body: &str,
+    ) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", content_type)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    const JSON: &str = "application/json";
+    const FORM: &str = "application/x-www-form-urlencoded";
+
+    #[tokio::test]
+    async fn monitoring_only_mode_hides_management_controls() {
+        let db = test_db().await;
+        let id = insert_managed_peer(&db, "MONITORED_KEY=", "alice").await;
+        let app = test_router_with_interface(db, monitoring_only_selector());
+
+        let list = monitoring_get(&app, "/").await;
+        assert!(list.contains("Monitoring-only mode"), "{list}");
+        assert!(list.contains("monitors awg1 but the installer manages awg0"));
+        assert!(!list.contains("action=\"/admin/users/add\""));
+        assert!(!list.contains("action=\"/admin/protocol/enable-awg31\""));
+        assert!(!list.contains("action=\"/admin/imitation\""));
+
+        let detail = monitoring_get(&app, &format!("/peers/{id}")).await;
+        assert!(detail.contains("Monitoring-only mode"), "{detail}");
+        assert!(!detail.contains("Remove user"));
+        assert!(!detail.contains("type=\"checkbox\" name=\"disabled\""));
+        assert!(!detail.contains("name=\"expiration_days\""));
+        assert!(detail.contains("name=\"display_name\""));
+    }
+
+    #[tokio::test]
+    async fn override_matching_the_installer_interface_keeps_management() {
+        let db = test_db().await;
+        let id = insert_managed_peer(&db, "MANAGED_KEY=", "alice").await;
+        let app = test_router_with_interface(db.clone(), managing_override_selector());
+
+        let list = monitoring_get(&app, "/").await;
+        assert!(!list.contains("Monitoring-only mode"));
+        assert!(list.contains("action=\"/admin/users/add\""));
+        assert!(list.contains("action=\"/admin/protocol/enable-awg31\""));
+        assert!(list.contains("action=\"/admin/imitation\""));
+
+        let detail = monitoring_get(&app, &format!("/peers/{id}")).await;
+        assert!(detail.contains("Remove user"));
+        assert!(detail.contains("type=\"checkbox\" name=\"disabled\""));
+
+        let disable = monitoring_post(
+            &app,
+            "PATCH",
+            &format!("/api/peers/{id}"),
+            JSON,
+            r#"{"disabled":true}"#,
+        )
+        .await;
+        assert_eq!(disable.status(), StatusCode::OK);
+        let row = crate::db::peers::find_by_id(&db.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.disabled, 1);
+    }
+
+    #[tokio::test]
+    async fn monitoring_only_mode_refuses_lifecycle_and_protocol_changes() {
+        let db = test_db().await;
+        let id = insert_managed_peer(&db, "MONITORED_KEY=", "alice").await;
+        let app = test_router_with_interface(db.clone(), monitoring_only_selector());
+        let peer_uri = format!("/api/peers/{id}");
+
+        let create =
+            monitoring_post(&app, "POST", "/api/admin/users", JSON, r#"{"name":"bob"}"#).await;
+        assert_eq!(create.status(), StatusCode::CONFLICT);
+        let reason = monitoring_body(create).await;
+        assert!(reason.contains("monitors awg1"), "{reason}");
+        assert!(reason.contains("installer manages awg0"), "{reason}");
+
+        let remove = monitoring_post(
+            &app,
+            "POST",
+            &format!("/api/admin/users/{id}/remove"),
+            JSON,
+            "{}",
+        )
+        .await;
+        assert_eq!(remove.status(), StatusCode::CONFLICT);
+
+        let disable = monitoring_post(&app, "PATCH", &peer_uri, JSON, r#"{"disabled":true}"#).await;
+        assert_eq!(disable.status(), StatusCode::CONFLICT);
+        let expire =
+            monitoring_post(&app, "PATCH", &peer_uri, JSON, r#"{"expiration_days":7}"#).await;
+        assert_eq!(expire.status(), StatusCode::CONFLICT);
+        let rename = monitoring_post(
+            &app,
+            "PATCH",
+            &peer_uri,
+            JSON,
+            r#"{"display_name":"renamed"}"#,
+        )
+        .await;
+        assert_eq!(rename.status(), StatusCode::OK);
+
+        let protocol = monitoring_post(
+            &app,
+            "POST",
+            "/admin/protocol/enable-awg31",
+            FORM,
+            "confirm=yes",
+        )
+        .await;
+        assert_eq!(protocol.status(), StatusCode::CONFLICT);
+        let imitation = monitoring_post(
+            &app,
+            "POST",
+            "/admin/imitation",
+            FORM,
+            "confirm=yes&protocol=none&domain=",
+        )
+        .await;
+        assert_eq!(imitation.status(), StatusCode::CONFLICT);
+
+        let add_form = monitoring_post(&app, "POST", "/admin/users/add", FORM, "name=bob").await;
+        assert_eq!(add_form.status(), StatusCode::OK);
+        assert!(monitoring_body(add_form)
+            .await
+            .contains("installer manages awg0"));
+        let remove_form = monitoring_post(
+            &app,
+            "POST",
+            &format!("/admin/users/{id}/remove"),
+            FORM,
+            "confirm=yes",
+        )
+        .await;
+        assert_eq!(remove_form.status(), StatusCode::CONFLICT);
+        assert!(monitoring_body(remove_form).await.contains("Remove failed"));
+
+        // The HTML edit form may change names and comments but not the
+        // disabled state or the expiration.
+        let toggle = monitoring_post(
+            &app,
+            "POST",
+            &format!("/peers/{id}"),
+            FORM,
+            "display_name=edited&disabled=1",
+        )
+        .await;
+        assert_eq!(toggle.status(), StatusCode::CONFLICT);
+        let expire_form = monitoring_post(
+            &app,
+            "POST",
+            &format!("/peers/{id}"),
+            FORM,
+            "display_name=edited&expiration_days=7",
+        )
+        .await;
+        assert_eq!(expire_form.status(), StatusCode::CONFLICT);
+        let edit = monitoring_post(
+            &app,
+            "POST",
+            &format!("/peers/{id}"),
+            FORM,
+            "display_name=edited",
+        )
+        .await;
+        assert_ne!(edit.status(), StatusCode::CONFLICT);
+
+        let row = crate::db::peers::find_by_id(&db.pool, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.display_name.as_deref(), Some("edited"));
+        assert_eq!(row.disabled, 0);
+        assert!(row.expires_at.is_none());
+        let removal_pending: i64 =
+            sqlx::query_scalar("SELECT removal_pending FROM peers WHERE id = ?")
+                .bind(id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(removal_pending, 0);
+    }
+
+    #[test]
+    fn scoped_web_commands_only_target_the_managed_interface() {
+        let dump = crate::awg::parse_dump(
+            "awg0\tP0\tS0=\t51820\toff\n\
+             awg0\tSHARED_KEY=\t(none)\t(none)\t10.8.0.2/32\t0\t0\t0\toff\n\
+             awg1\tP1\tS1=\t51821\toff\n\
+             awg1\tSHARED_KEY=\t(none)\t(none)\t10.9.0.2/32\t0\t0\t0\toff\n\
+             awg1\tOTHER_KEY=\t(none)\t(none)\t10.9.0.3/32\t0\t0\t0\toff\n",
+        )
+        .expect("parse dump");
+
+        assert_eq!(
+            peer_removal_targets(dump.clone(), "awg1", "SHARED_KEY="),
+            vec!["awg1".to_string()]
+        );
+        assert_eq!(
+            peer_removal_targets(dump.clone(), "awg0", "SHARED_KEY="),
+            vec!["awg0".to_string()]
+        );
+        assert!(peer_removal_targets(dump.clone(), "awg0", "OTHER_KEY=").is_empty());
+        assert_eq!(
+            interface_sync_targets(dump.clone(), "awg0"),
+            vec!["awg0".to_string()]
+        );
+        assert!(interface_sync_targets(dump, "awg2").is_empty());
+    }
 
     #[tokio::test]
     async fn api_create_user_rejects_empty_name() {

@@ -245,7 +245,7 @@ All settings are read from environment variables (or a `.env`-style file via sys
 | `AWG_WEB_DB` | `awg-web.db` | Path to SQLite database file (created automatically) |
 | `AWG_CONFIG_DIR` | `/etc/amnezia/amneziawg/clients` | Directory of client `.conf` files |
 | `AWG_POLL_INTERVAL` | `30` | Polling interval in seconds |
-| `AWG_INTERFACE` | *(from params)* | AWG interface to monitor and manage. Defaults to `SERVER_AWG_NIC` from the installer params; set it only when the host runs several AWG interfaces and the panel should follow a different one. |
+| `AWG_INTERFACE` | *(from params)* | AWG interface to follow. Defaults to `SERVER_AWG_NIC` from the installer params; naming any other interface puts the panel into monitoring-only mode (see below). |
 | `AWG_SNAPSHOT_RETENTION_DAYS` | `31` | Snapshot retention window in days (0 to disable cleanup). In-window snapshots are kept, plus one older baseline snapshot per peer for accurate usage deltas. |
 | `AWG_PROXY_SESSIONS_FILE` | `/var/lib/amneziawg-proxy/sessions.json` | Optional proxy active-session status file |
 | `RUST_LOG` | `amneziawg_web=info` | Log level (`error`/`warn`/`info`/`debug`) |
@@ -256,7 +256,7 @@ All settings are read from environment variables (or a `.env`-style file via sys
 | `AUTH_SECURE_COOKIE` | `false` | Add `Secure` flag to session cookie (use with HTTPS) |
 | `AUTH_SESSION_TTL_SECS` | `86400` | Session lifetime in seconds (default 24 h) |
 
-**Hosts with several AWG interfaces.** The panel manages exactly one
+**Hosts with several AWG interfaces.** The panel follows exactly one
 interface: `SERVER_AWG_NIC` from the installer params, or `AWG_INTERFACE` when
 it is set. The poller records peers of that interface only, and disabling,
 restoring or removing a peer never touches another interface. The log names
@@ -264,6 +264,19 @@ the monitored interface at startup and warns once when `awg show all dump`
 reports other interfaces. Peer rows recorded earlier from an interface that is
 now ignored are treated as stale: enabled rows are removed on the next poll,
 while disabled rows are kept, as for any disabled peer, until you archive them.
+
+**Monitoring-only mode.** Client creation and removal, expiration cleanup,
+enabling or disabling peers, and the protocol and imitation controls all work
+through the installer's params, server config and scripts, which describe
+`SERVER_AWG_NIC` only. When `AWG_INTERFACE` names any other interface (or the
+params cannot be read), that panel instance therefore runs in monitoring-only
+mode: it records the interface and still lets you edit names and comments, but
+every management action is refused with `this panel instance monitors awg1 but
+the installer manages awg0; client, peer and protocol management are
+unavailable (monitoring-only mode)`, the corresponding controls are hidden, and
+the mode is logged at startup. Use the override to watch a hand-made interface
+next to the installer's one; managing a second interface would need its own
+installer params and is not supported.
 
 See [`.env.example`](.env.example) for a ready-to-copy template.
 

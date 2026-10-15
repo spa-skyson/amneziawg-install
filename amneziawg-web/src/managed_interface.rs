@@ -1,4 +1,5 @@
-//! Selection of the AmneziaWG interface the panel manages.
+//! Selection of the AmneziaWG interface the panel follows, and what it may do
+//! with it.
 //!
 //! The installer supports one interface per host and records its name as
 //! `SERVER_AWG_NIC` in the params file.  A host may still carry further,
@@ -8,14 +9,29 @@
 //! own interface, and the enforcement helpers would act on interfaces the
 //! panel does not own.
 //!
-//! [`InterfaceSelector`] resolves the managed interface name, either from the
+//! [`InterfaceSelector`] resolves the followed interface, either from the
 //! optional `AWG_INTERFACE` override or from the installer params, and
 //! [`scope_to_interface`] narrows a parsed dump to that interface.
+//!
+//! Client creation and removal, expiration cleanup, peer enforcement and the
+//! protocol and imitation controls all work through the installer's params,
+//! server config and scripts, which only ever describe `SERVER_AWG_NIC`.  So
+//! the selector also yields a [`PanelMode`]: following the installer's own
+//! interface allows full management, while an override that names any other
+//! interface (or unreadable params) puts the panel into monitoring-only mode,
+//! in which it records the interface but never changes it, the installer's
+//! interface, or the protocol.
+
+use std::fmt;
+use std::sync::{Arc, RwLock};
 
 use crate::admin::client_manager::{parse_params, validate_interface_name_for};
 use crate::awg::{self, AwgInterface};
 
-/// Errors raised while determining the managed interface.
+/// Reads the installer params; normally the privileged helper's `read-params`.
+type ParamsReader = Arc<dyn Fn() -> Result<String, awg::AwgError> + Send + Sync>;
+
+/// Errors raised while determining the followed interface.
 #[derive(Debug, thiserror::Error)]
 pub enum ManagedInterfaceError {
     /// `AWG_INTERFACE` is set but is not a safe interface name.
@@ -35,21 +51,103 @@ pub enum ManagedInterfaceError {
     Task(String),
 }
 
-/// Decides which AWG interface the panel monitors and manages.
+/// What this panel instance may do with the interface it follows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PanelMode {
+    /// The followed interface is the installer's own: clients, peers and the
+    /// protocol can be managed.
+    Managing { interface: String },
+    /// `AWG_INTERFACE` names an interface the installer does not manage, or
+    /// the installer params cannot be read.  The panel records the interface
+    /// but refuses every change to it, to the installer's interface, and to
+    /// the protocol.
+    MonitoringOnly {
+        monitored: String,
+        /// `SERVER_AWG_NIC` from the params, or `None` when they are unreadable.
+        installer: Option<String>,
+    },
+}
+
+impl PanelMode {
+    /// The interface this panel instance follows.
+    pub fn interface(&self) -> &str {
+        match self {
+            PanelMode::Managing { interface } => interface,
+            PanelMode::MonitoringOnly { monitored, .. } => monitored,
+        }
+    }
+
+    /// Whether clients, peers and the protocol may be managed.
+    pub fn is_managing(&self) -> bool {
+        matches!(self, PanelMode::Managing { .. })
+    }
+
+    /// Why management requests are refused, or `None` when managing.
+    ///
+    /// The text is shown to operators in error responses and page banners.
+    pub fn management_unavailable(&self) -> Option<String> {
+        match self {
+            PanelMode::Managing { .. } => None,
+            PanelMode::MonitoringOnly {
+                monitored,
+                installer: Some(installer),
+            } => Some(format!(
+                "this panel instance monitors {monitored} but the installer manages {installer}; \
+                 client, peer and protocol management are unavailable (monitoring-only mode)"
+            )),
+            PanelMode::MonitoringOnly {
+                monitored,
+                installer: None,
+            } => Some(format!(
+                "this panel instance monitors {monitored} but the installer params could not be read; \
+                 client, peer and protocol management are unavailable (monitoring-only mode)"
+            )),
+        }
+    }
+}
+
+/// Decides which AWG interface the panel follows and in which [`PanelMode`].
 ///
-/// Cloning is cheap: the selector only stores the optional override.  The
-/// params are re-read on every [`resolve`](Self::resolve), so an interface
-/// renamed by re-running the installer is picked up without a restart.
-#[derive(Clone, Debug, Default)]
+/// Clones share one cache of the last resolved mode, so the poller's
+/// per-cycle resolution is visible to the web handlers without another
+/// privileged call.  The params are re-read on every resolution, so an
+/// interface renamed by re-running the installer is picked up without a
+/// restart.
+#[derive(Clone)]
 pub struct InterfaceSelector {
     /// Interface name pinned by `AWG_INTERFACE`; `None` defers to the params.
     override_name: Option<String>,
+    read_params: ParamsReader,
+    last_mode: Arc<RwLock<Option<PanelMode>>>,
+}
+
+impl fmt::Debug for InterfaceSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InterfaceSelector")
+            .field("override_name", &self.override_name)
+            .field("last_mode", &self.last_mode())
+            .finish()
+    }
+}
+
+impl Default for InterfaceSelector {
+    fn default() -> Self {
+        Self::from_params()
+    }
 }
 
 impl InterfaceSelector {
+    fn new(override_name: Option<String>) -> Self {
+        Self {
+            override_name,
+            read_params: Arc::new(awg::read_params_via_sudo),
+            last_mode: Arc::new(RwLock::new(None)),
+        }
+    }
+
     /// Follow `SERVER_AWG_NIC` from the installer params.
     pub fn from_params() -> Self {
-        Self::default()
+        Self::new(None)
     }
 
     /// Build a selector from the optional `AWG_INTERFACE` value.
@@ -65,9 +163,17 @@ impl InterfaceSelector {
         };
         validate_interface_name_for("AWG_INTERFACE", name)
             .map_err(ManagedInterfaceError::InvalidOverride)?;
-        Ok(Self {
-            override_name: Some(name.to_string()),
-        })
+        Ok(Self::new(Some(name.to_string())))
+    }
+
+    /// Replace the installer-params reader (tests never run the helper).
+    #[cfg(test)]
+    pub fn with_params_reader<F>(mut self, read_params: F) -> Self
+    where
+        F: Fn() -> Result<String, awg::AwgError> + Send + Sync + 'static,
+    {
+        self.read_params = Arc::new(read_params);
+        self
     }
 
     /// The `AWG_INTERFACE` override, if one is set.
@@ -75,7 +181,7 @@ impl InterfaceSelector {
         self.override_name.as_deref()
     }
 
-    /// Where the managed interface name comes from, for log lines.
+    /// Where the followed interface name comes from, for log lines.
     pub fn source(&self) -> &'static str {
         if self.override_name.is_some() {
             "AWG_INTERFACE"
@@ -84,34 +190,93 @@ impl InterfaceSelector {
         }
     }
 
-    /// Resolve the managed interface name.
+    /// Resolve the panel mode and remember it.
     ///
-    /// Without an override this reads the installer params through the
-    /// privileged helper – a blocking `sudo` call – so run it off the async
-    /// executor.
-    pub fn resolve(&self) -> Result<String, ManagedInterfaceError> {
-        self.resolve_with(awg::read_params_via_sudo)
+    /// This reads the installer params through the privileged helper – a
+    /// blocking `sudo` call – so run it off the async executor.  Without an
+    /// override the params are required; with one, unreadable params merely
+    /// mean monitoring-only mode.
+    pub fn resolve_mode(&self) -> Result<PanelMode, ManagedInterfaceError> {
+        let mode = self.classify((self.read_params)())?;
+        self.remember(mode.clone());
+        Ok(mode)
     }
 
-    /// [`resolve`](Self::resolve) with an injectable params reader.
-    pub fn resolve_with<F>(&self, read_params: F) -> Result<String, ManagedInterfaceError>
-    where
-        F: FnOnce() -> Result<String, awg::AwgError>,
-    {
-        if let Some(name) = &self.override_name {
-            return Ok(name.clone());
+    /// [`resolve_mode`](Self::resolve_mode) on the blocking pool.
+    pub async fn resolve_mode_off_thread(&self) -> Result<PanelMode, ManagedInterfaceError> {
+        let selector = self.clone();
+        match tokio::task::spawn_blocking(move || selector.resolve_mode()).await {
+            Ok(result) => result,
+            Err(e) => Err(ManagedInterfaceError::Task(e.to_string())),
         }
-        let content = read_params().map_err(ManagedInterfaceError::ParamsRead)?;
-        let params = parse_params(&content)
-            .map_err(|e| ManagedInterfaceError::ParamsParse(e.to_string()))?;
-        Ok(params.server_awg_nic)
+    }
+
+    /// The last resolved mode, or a fresh resolution when none is cached yet
+    /// (only before the poller's first cycle has completed).
+    pub async fn current_mode(&self) -> Result<PanelMode, ManagedInterfaceError> {
+        if let Some(mode) = self.last_mode() {
+            return Ok(mode);
+        }
+        self.resolve_mode_off_thread().await
+    }
+
+    /// The last successfully resolved mode, if any.
+    pub fn last_mode(&self) -> Option<PanelMode> {
+        match self.last_mode.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn remember(&self, mode: PanelMode) {
+        match self.last_mode.write() {
+            Ok(mut guard) => *guard = Some(mode),
+            Err(poisoned) => *poisoned.into_inner() = Some(mode),
+        }
+    }
+
+    fn classify(
+        &self,
+        params: Result<String, awg::AwgError>,
+    ) -> Result<PanelMode, ManagedInterfaceError> {
+        let installer = params
+            .map_err(ManagedInterfaceError::ParamsRead)
+            .and_then(|content| {
+                parse_params(&content)
+                    .map(|params| params.server_awg_nic)
+                    .map_err(|e| ManagedInterfaceError::ParamsParse(e.to_string()))
+            });
+        match (&self.override_name, installer) {
+            (None, Ok(interface)) => Ok(PanelMode::Managing { interface }),
+            (None, Err(e)) => Err(e),
+            (Some(monitored), Ok(installer)) if installer == *monitored => {
+                Ok(PanelMode::Managing {
+                    interface: installer,
+                })
+            }
+            (Some(monitored), Ok(installer)) => Ok(PanelMode::MonitoringOnly {
+                monitored: monitored.clone(),
+                installer: Some(installer),
+            }),
+            (Some(monitored), Err(e)) => {
+                tracing::debug!(
+                    error = %e,
+                    monitored = %monitored,
+                    "installer params unavailable – AWG_INTERFACE runs in monitoring-only mode"
+                );
+                Ok(PanelMode::MonitoringOnly {
+                    monitored: monitored.clone(),
+                    installer: None,
+                })
+            }
+        }
     }
 }
 
-/// A parsed dump narrowed to the managed interface.
+/// A parsed dump narrowed to the followed interface.
 #[derive(Debug, Default)]
 pub struct ScopedInterfaces {
-    /// The managed interface when the dump contained it (at most one entry).
+    /// The followed interface when the dump contained it (at most one entry).
     pub matched: Vec<AwgInterface>,
     /// Names of the other interfaces in the dump, sorted.
     pub ignored: Vec<String>,
@@ -131,13 +296,30 @@ pub fn scope_to_interface(interfaces: Vec<AwgInterface>, managed: &str) -> Scope
     scoped
 }
 
+/// Minimal AWG 2.0 installer params naming `nic`, for tests across the crate.
+#[cfg(test)]
+pub(crate) fn test_params(nic: &str) -> String {
+    format!(
+        "SERVER_PUB_IP='198.51.100.1'\nSERVER_AWG_NIC='{nic}'\nSERVER_AWG_IPV4='10.66.66.1'\n\
+         SERVER_AWG_IPV6='fd42:42:42::1'\nSERVER_PORT='51820'\nSERVER_PUB_KEY='PUB'\n\
+         CLIENT_DNS_1='1.1.1.1'\nALLOWED_IPS='0.0.0.0/0, ::/0'\nSERVER_AWG_JC='4'\n\
+         SERVER_AWG_JMIN='50'\nSERVER_AWG_JMAX='1000'\nSERVER_AWG_S1='30'\nSERVER_AWG_S2='100'\n\
+         SERVER_AWG_S3='45'\nSERVER_AWG_S4='120'\nSERVER_AWG_H1='5-10'\nSERVER_AWG_H2='11-20'\n\
+         SERVER_AWG_H3='21-30'\nSERVER_AWG_H4='31-40'\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::PublicKey;
 
-    /// Minimal AWG 2.0 params as serialized by the installer.
-    const PARAMS_AWG0: &str = "SERVER_PUB_IP='198.51.100.1'\nSERVER_AWG_NIC='awg0'\nSERVER_AWG_IPV4='10.66.66.1'\nSERVER_AWG_IPV6='fd42:42:42::1'\nSERVER_PORT='51820'\nSERVER_PUB_KEY='PUB'\nCLIENT_DNS_1='1.1.1.1'\nALLOWED_IPS='0.0.0.0/0, ::/0'\nSERVER_AWG_JC='4'\nSERVER_AWG_JMIN='50'\nSERVER_AWG_JMAX='1000'\nSERVER_AWG_S1='30'\nSERVER_AWG_S2='100'\nSERVER_AWG_S3='45'\nSERVER_AWG_S4='120'\nSERVER_AWG_H1='5-10'\nSERVER_AWG_H2='11-20'\nSERVER_AWG_H3='21-30'\nSERVER_AWG_H4='31-40'\n";
+    fn unreadable_params() -> Result<String, awg::AwgError> {
+        Err(awg::AwgError::NonZeroExit {
+            status: 1,
+            stderr: "sudo: a password is required".into(),
+        })
+    }
 
     fn iface(name: &str, peer_keys: &[&str]) -> AwgInterface {
         AwgInterface {
@@ -159,21 +341,10 @@ mod tests {
     }
 
     #[test]
-    fn override_wins_without_reading_params() {
-        let selector = InterfaceSelector::from_override(Some("awg1")).expect("valid override");
-        assert_eq!(selector.override_name(), Some("awg1"));
-        assert_eq!(selector.source(), "AWG_INTERFACE");
-
-        let resolved = selector
-            .resolve_with(|| panic!("params must not be read when AWG_INTERFACE is set"))
-            .expect("resolve override");
-        assert_eq!(resolved, "awg1");
-    }
-
-    #[test]
     fn override_is_trimmed_and_blank_means_unset() {
         let trimmed = InterfaceSelector::from_override(Some("  awg1\n")).expect("trimmed");
         assert_eq!(trimmed.override_name(), Some("awg1"));
+        assert_eq!(trimmed.source(), "AWG_INTERFACE");
 
         for blank in [None, Some(""), Some("   ")] {
             let selector = InterfaceSelector::from_override(blank).expect("blank is unset");
@@ -205,47 +376,119 @@ mod tests {
     }
 
     #[test]
-    fn params_provide_the_interface_when_no_override_is_set() {
-        let selector = InterfaceSelector::from_params();
-        let resolved = selector
-            .resolve_with(|| Ok(PARAMS_AWG0.to_string()))
-            .expect("resolve from params");
-        assert_eq!(resolved, "awg0");
+    fn params_alone_select_the_installer_interface_for_management() {
+        let selector =
+            InterfaceSelector::from_params().with_params_reader(|| Ok(test_params("awg0")));
+        assert_eq!(
+            selector.resolve_mode().expect("resolve"),
+            PanelMode::Managing {
+                interface: "awg0".into()
+            }
+        );
     }
 
     #[test]
-    fn params_read_failure_is_reported() {
-        let selector = InterfaceSelector::from_params();
-        let error = selector
-            .resolve_with(|| {
-                Err(awg::AwgError::NonZeroExit {
-                    status: 1,
-                    stderr: "sudo: a password is required".into(),
-                })
-            })
-            .expect_err("read failure");
+    fn override_matching_the_params_keeps_management() {
+        let selector = InterfaceSelector::from_override(Some("awg0"))
+            .expect("valid override")
+            .with_params_reader(|| Ok(test_params("awg0")));
+        let mode = selector.resolve_mode().expect("resolve");
+        assert!(mode.is_managing());
+        assert_eq!(mode.interface(), "awg0");
+        assert!(mode.management_unavailable().is_none());
+    }
+
+    #[test]
+    fn override_naming_another_interface_is_monitoring_only() {
+        let selector = InterfaceSelector::from_override(Some("awg1"))
+            .expect("valid override")
+            .with_params_reader(|| Ok(test_params("awg0")));
+        let mode = selector.resolve_mode().expect("resolve");
+        assert_eq!(
+            mode,
+            PanelMode::MonitoringOnly {
+                monitored: "awg1".into(),
+                installer: Some("awg0".into()),
+            }
+        );
+        assert_eq!(mode.interface(), "awg1");
+
+        let reason = mode.management_unavailable().expect("reason");
+        assert!(reason.contains("monitors awg1"), "{reason}");
+        assert!(reason.contains("installer manages awg0"), "{reason}");
+    }
+
+    #[test]
+    fn override_with_unreadable_params_is_monitoring_only() {
+        let selector = InterfaceSelector::from_override(Some("awg1"))
+            .expect("valid override")
+            .with_params_reader(unreadable_params);
+        let mode = selector.resolve_mode().expect("override needs no params");
+        assert_eq!(
+            mode,
+            PanelMode::MonitoringOnly {
+                monitored: "awg1".into(),
+                installer: None,
+            }
+        );
+        let reason = mode.management_unavailable().expect("reason");
+        assert!(reason.contains("params could not be read"), "{reason}");
+
+        let unparseable = InterfaceSelector::from_override(Some("awg1"))
+            .expect("valid override")
+            .with_params_reader(|| Ok("SERVER_AWG_NIC='awg0'\n".to_string()));
+        assert!(!unparseable.resolve_mode().expect("resolve").is_managing());
+    }
+
+    #[test]
+    fn params_failures_are_errors_without_an_override() {
+        let unreadable = InterfaceSelector::from_params().with_params_reader(unreadable_params);
+        let error = unreadable.resolve_mode().expect_err("read failure");
         assert!(matches!(error, ManagedInterfaceError::ParamsRead(_)));
         assert!(error.to_string().contains("a password is required"));
-    }
+        assert!(unreadable.last_mode().is_none());
 
-    #[test]
-    fn unparseable_params_are_reported() {
-        let selector = InterfaceSelector::from_params();
-
-        let missing_keys = selector
-            .resolve_with(|| Ok("SERVER_AWG_NIC='awg0'\n".to_string()))
-            .expect_err("missing keys");
+        let missing_keys = InterfaceSelector::from_params()
+            .with_params_reader(|| Ok("SERVER_AWG_NIC='awg0'\n".to_string()));
         assert!(matches!(
-            missing_keys,
+            missing_keys.resolve_mode().expect_err("missing keys"),
             ManagedInterfaceError::ParamsParse(_)
         ));
 
-        let unsafe_nic = selector
-            .resolve_with(|| {
-                Ok(PARAMS_AWG0.replace("SERVER_AWG_NIC='awg0'", "SERVER_AWG_NIC='../etc'"))
-            })
-            .expect_err("unsafe nic");
-        assert!(matches!(unsafe_nic, ManagedInterfaceError::ParamsParse(_)));
+        let unsafe_nic = InterfaceSelector::from_params()
+            .with_params_reader(|| Ok(test_params("awg0").replace("'awg0'", "'../etc'")));
+        assert!(matches!(
+            unsafe_nic.resolve_mode().expect_err("unsafe nic"),
+            ManagedInterfaceError::ParamsParse(_)
+        ));
+    }
+
+    #[test]
+    fn resolved_mode_is_shared_between_clones() {
+        let selector = InterfaceSelector::from_override(Some("awg1"))
+            .expect("valid override")
+            .with_params_reader(|| Ok(test_params("awg0")));
+        let clone = selector.clone();
+        assert!(selector.last_mode().is_none());
+
+        let mode = clone.resolve_mode().expect("resolve");
+        assert_eq!(selector.last_mode(), Some(mode));
+    }
+
+    #[tokio::test]
+    async fn current_mode_resolves_once_and_then_serves_the_cache() {
+        let selector = InterfaceSelector::from_override(Some("awg1"))
+            .expect("valid override")
+            .with_params_reader(|| Ok(test_params("awg0")));
+        let first = selector.current_mode().await.expect("first resolution");
+        assert!(!first.is_managing());
+
+        let off_thread = selector
+            .resolve_mode_off_thread()
+            .await
+            .expect("off-thread resolution");
+        assert_eq!(off_thread, first);
+        assert_eq!(selector.current_mode().await.expect("cached"), first);
     }
 
     #[test]

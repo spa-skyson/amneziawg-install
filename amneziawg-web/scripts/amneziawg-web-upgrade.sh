@@ -1197,9 +1197,10 @@ main() {
     if [[ -f "${ENV_FILE}" ]] && ! grep -Eq '^[[:space:]]*#?[[:space:]]*AWG_INTERFACE=' "${ENV_FILE}" 2>/dev/null; then
         {
             printf '\n'
-            printf '# Optional: AWG interface to monitor and manage. Defaults to SERVER_AWG_NIC\n'
-            printf '# from the installer params; set it only when this host runs several AWG\n'
-            printf '# interfaces and the panel should follow a different one.\n'
+            printf '# Optional: AWG interface to follow. Defaults to SERVER_AWG_NIC from the\n'
+            printf '# installer params; set it only when this host runs several AWG interfaces and\n'
+            printf '# the panel should follow a different one. Any other interface is monitored\n'
+            printf '# only (no client, peer or protocol management).\n'
             printf '# AWG_INTERFACE=awg0\n'
         } >>"${ENV_FILE}" && info "Added commented AWG_INTERFACE hint to ${ENV_FILE}."
     fi

@@ -4,14 +4,18 @@
 //! between the *start* of consecutive cycles is `interval` seconds, regardless
 //! of how long each cycle takes.
 //!
+//! 0. Resolves the panel mode: which interface this instance follows
+//!    (`AWG_INTERFACE`, else `SERVER_AWG_NIC` from the installer params) and
+//!    whether it may manage it.  An override naming an interface the installer
+//!    does not manage puts the panel into monitoring-only mode.
 //! 1. Calls `awg::show_all_dump()` on a blocking thread – reads current AWG state
-//!    and keeps only the managed interface (`AWG_INTERFACE`, else `SERVER_AWG_NIC`
-//!    from the installer params).  Other interfaces on the host are ignored.
+//!    and keeps only the followed interface.  Other interfaces on the host are
+//!    ignored.
 //! 2. Writes a snapshot row per peer into `snapshots`.
 //! 3. Upserts each peer into the `peers` table.
 //!    3b. Removes disabled peers from the running AWG interface
-//!    (`awg set <iface> peer <key> remove`).  This is a self-healing
-//!    safety net; immediate removal also happens at toggle time.
+//!    (`awg set <iface> peer <key> remove`; management mode only).  This is a
+//!    self-healing safety net; immediate removal also happens at toggle time.
 //! 4. Scans the config directory for `*.conf` files.
 //! 5. Applies config-to-peer mapping (sets `has_config`, `config_name`,
 //!    `config_path` on matching peers).
@@ -22,8 +26,8 @@
 //!
 //! Errors within a single cycle step are logged and the cycle continues;
 //! the overall polling loop never stops due to a single-cycle failure.
-//! Expired managed users are removed before each AWG snapshot, including the
-//! poller's immediate first cycle at process startup.
+//! In management mode, expired managed users are removed before each AWG
+//! snapshot, including the poller's immediate first cycle at process startup.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -38,7 +42,7 @@ use crate::config_store;
 use crate::db::Database;
 use crate::domain::PublicKey;
 use crate::managed_interface::{
-    scope_to_interface, InterfaceSelector, ManagedInterfaceError, ScopedInterfaces,
+    scope_to_interface, InterfaceSelector, PanelMode, ScopedInterfaces,
 };
 
 /// Serializes access to the clear-all + re-map sequence so that concurrent
@@ -188,35 +192,14 @@ impl Poller {
         let start = std::time::Instant::now();
         debug!("poll cycle starting");
 
-        // ── Step 0: Expired-user cleanup ────────────────────────────────────
-        // The first interval tick fires immediately, so this also catches
-        // expirations missed while the web service was stopped. Running it
-        // before AWG discovery means cleanup is still attempted if AWG status
-        // collection fails later in the cycle.
-        match crate::admin::cleanup_expired_users(
-            &self.db,
-            &self.config_dir,
-            &self.lifecycle_lock_dir,
-        )
-        .await
-        {
-            Ok(removed) if removed > 0 => {
-                info!(removed, "expired-user cleanup complete");
-            }
-            Ok(_) => {}
-            Err(e) => {
-                error!(error = %e, "expired-user cleanup query failed – continuing");
-            }
-        }
-
-        // ── Step 1–3: AWG data ───────────────────────────────────────────────
-        // Resolve the managed interface first.  Without an AWG_INTERFACE
-        // override this reads the installer params through the privileged
+        // ── Step 0: Panel mode ───────────────────────────────────────────────
+        // Resolve which interface this instance follows and whether it may
+        // manage it.  This reads the installer params through the privileged
         // helper – a blocking `sudo` call, run off the async executor like the
         // dump itself.  Without a name there is nothing safe to scope the
         // dump to, so the cycle's AWG steps are skipped.
-        let managed = match self.resolve_managed_interface().await {
-            Ok(name) => name,
+        let mode = match self.interface.resolve_mode_off_thread().await {
+            Ok(mode) => mode,
             Err(e) => {
                 error!(
                     error = %e,
@@ -225,7 +208,18 @@ impl Poller {
                 return Err(e.into());
             }
         };
+        self.log_mode(&mode);
+        let managed = mode.interface();
 
+        // ── Step 0b: Expired-user cleanup ────────────────────────────────────
+        // The first interval tick fires immediately, so this also catches
+        // expirations missed while the web service was stopped. Running it
+        // before AWG discovery means cleanup is still attempted if AWG status
+        // collection fails later in the cycle.  Removal rewrites the
+        // installer's server config, so it only runs in management mode.
+        self.cleanup_expired_users_step(&mode).await;
+
+        // ── Step 1–3: AWG data ───────────────────────────────────────────────
         // `awg show all dump` is a blocking process; run it off the async
         // executor so the independent retention timer (and HTTP tasks) can
         // still be polled while the command is in flight.
@@ -247,8 +241,8 @@ impl Poller {
         let ScopedInterfaces {
             matched: interfaces,
             ignored,
-        } = scope_to_interface(interfaces, &managed);
-        self.log_scope(&managed, !interfaces.is_empty(), &ignored);
+        } = scope_to_interface(interfaces, managed);
+        self.log_scope(managed, !interfaces.is_empty(), &ignored);
 
         let peer_count: usize = interfaces.iter().map(|i| i.peers.len()).sum();
         info!(
@@ -279,9 +273,17 @@ impl Poller {
         // on the running AWG interface.  This is a self-healing safety net:
         // immediate removal also happens at toggle time (web/admin handlers),
         // but the poller ensures eventual consistency (e.g. after an AWG
-        // restart that re-reads the on-disk config).
-        if let Err(e) = self.enforce_disabled_peers(&interfaces).await {
-            error!(error = %e, "enforce-disabled step failed – continuing");
+        // restart that re-reads the on-disk config).  A monitoring-only
+        // instance never changes the interface it follows.
+        if mode.is_managing() {
+            if let Err(e) = self.enforce_disabled_peers(&interfaces).await {
+                error!(error = %e, "enforce-disabled step failed – continuing");
+            }
+        } else {
+            debug!(
+                interface = %managed,
+                "monitoring-only mode – disabled peers are not removed from the interface"
+            );
         }
 
         // ── Step 4–5: Config mapping ─────────────────────────────────────────
@@ -305,9 +307,61 @@ impl Poller {
         Ok(())
     }
 
-    /// Resolve the managed interface name on the blocking pool.
-    async fn resolve_managed_interface(&self) -> Result<String, ManagedInterfaceError> {
-        resolve_managed_interface(&self.interface).await
+    /// Remove due managed users, unless this instance only monitors its
+    /// interface: removal rewrites the installer's server config and
+    /// reconciles the installer's interface, which may be a different one.
+    async fn cleanup_expired_users_step(&self, mode: &PanelMode) {
+        if !mode.is_managing() {
+            debug!(
+                interface = %mode.interface(),
+                "monitoring-only mode – expired-user cleanup skipped"
+            );
+            return;
+        }
+        match crate::admin::cleanup_expired_users(
+            &self.db,
+            &self.config_dir,
+            &self.lifecycle_lock_dir,
+        )
+        .await
+        {
+            Ok(removed) if removed > 0 => {
+                info!(removed, "expired-user cleanup complete");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                error!(error = %e, "expired-user cleanup query failed – continuing");
+            }
+        }
+    }
+
+    /// Log the panel mode once at startup and again whenever it changes.
+    fn log_mode(&self, mode: &PanelMode) {
+        let previous = match self.scope_log.lock() {
+            Ok(mut state) => state.observe_mode(mode),
+            Err(poisoned) => poisoned.into_inner().observe_mode(mode),
+        };
+        let Some(previous) = previous else {
+            return;
+        };
+        match mode {
+            PanelMode::MonitoringOnly {
+                monitored,
+                installer,
+            } => warn!(
+                monitored = %monitored,
+                installer = installer.as_deref().unwrap_or("(params unreadable)"),
+                "monitoring-only mode: this panel instance only records its interface; client, peer and protocol management are unavailable"
+            ),
+            PanelMode::Managing { interface } => {
+                if previous.is_some() {
+                    info!(
+                        interface = %interface,
+                        "management mode restored: the followed interface is the installer's"
+                    );
+                }
+            }
+        }
     }
 
     /// Report scope changes: the monitored interface (at startup and whenever
@@ -733,6 +787,7 @@ impl Poller {
 /// Tracks the last reported poll scope so changes are logged once.
 #[derive(Debug, Default)]
 struct ScopeLog {
+    mode: Option<PanelMode>,
     interface: Option<String>,
     present: Option<bool>,
     ignored: Option<Vec<String>>,
@@ -769,19 +824,14 @@ impl ScopeLog {
         self.ignored = Some(ignored.to_vec());
         changes
     }
-}
 
-/// Resolve the managed interface name off the async executor.
-///
-/// Without an `AWG_INTERFACE` override this runs the privileged helper's
-/// `read-params` through `sudo`, which must not block a Tokio worker.
-async fn resolve_managed_interface(
-    interface: &InterfaceSelector,
-) -> Result<String, ManagedInterfaceError> {
-    let interface = interface.clone();
-    match tokio::task::spawn_blocking(move || interface.resolve()).await {
-        Ok(result) => result,
-        Err(e) => Err(ManagedInterfaceError::Task(e.to_string())),
+    /// Record the panel mode.  Returns the previous value when it changed
+    /// (`Some(None)` on the first observation) and `None` when unchanged.
+    fn observe_mode(&mut self, mode: &PanelMode) -> Option<Option<PanelMode>> {
+        if self.mode.as_ref() == Some(mode) {
+            return None;
+        }
+        Some(self.mode.replace(mode.clone()))
     }
 }
 
@@ -835,7 +885,8 @@ pub async fn sync_peers_from_awg(
     db: &crate::db::Database,
     interface: &InterfaceSelector,
 ) -> anyhow::Result<()> {
-    let managed = resolve_managed_interface(interface)
+    let mode = interface
+        .resolve_mode_off_thread()
         .await
         .context("cannot determine the managed AWG interface")?;
     let interfaces = match collect_awg_dump().await {
@@ -846,7 +897,7 @@ pub async fn sync_peers_from_awg(
         }
         Err(e) => return Err(e.into()),
     };
-    let interfaces = scope_to_interface(interfaces, &managed).matched;
+    let interfaces = scope_to_interface(interfaces, mode.interface()).matched;
 
     let mut tx = db.pool.begin().await.context("begin sync_peers tx")?;
     for iface in &interfaces {
@@ -1609,12 +1660,100 @@ awg1\tFOREIGN_PEER=\t(none)\t203.0.113.11:4001\t10.9.0.2/32\t1700000000\t30\t40\
     }
 
     #[tokio::test]
-    async fn resolve_managed_interface_uses_override_without_params() {
-        let selector = InterfaceSelector::from_override(Some("awg1")).expect("valid override");
-        let resolved = resolve_managed_interface(&selector)
+    async fn override_without_readable_params_still_names_the_followed_interface() {
+        let selector = InterfaceSelector::from_override(Some("awg1"))
+            .expect("valid override")
+            .with_params_reader(|| {
+                Err(awg::AwgError::NonZeroExit {
+                    status: 1,
+                    stderr: "sudo: a password is required".into(),
+                })
+            });
+        let mode = selector
+            .resolve_mode_off_thread()
             .await
             .expect("override needs no params");
-        assert_eq!(resolved, "awg1");
+        assert_eq!(mode.interface(), "awg1");
+        assert!(!mode.is_managing());
+    }
+
+    async fn seed_expired_managed_peer(db: &Database) -> i64 {
+        sqlx::query(
+            "INSERT INTO peers (public_key, allowed_ips, managed_client_name, expires_at) \
+             VALUES ('EXPIRED_SCOPE_KEY=', '10.66.66.9/32', 'expired-user', '2000-01-01T00:00:00Z')",
+        )
+        .execute(&db.pool)
+        .await
+        .expect("seed expired peer")
+        .last_insert_rowid()
+    }
+
+    async fn removal_pending(db: &Database, id: i64) -> i64 {
+        sqlx::query_scalar("SELECT removal_pending FROM peers WHERE id = ?")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("removal_pending")
+    }
+
+    #[tokio::test]
+    async fn expired_user_cleanup_only_runs_in_management_mode() {
+        let db = Database::connect_for_test().await.expect("test database");
+        let id = seed_expired_managed_peer(&db).await;
+        let state_dir = tempfile::tempdir().expect("state tempdir");
+        let poller = Poller::new_full(
+            db.clone(),
+            30,
+            state_dir.path().join("missing-clients"),
+            state_dir.path().to_path_buf(),
+            0,
+            InterfaceSelector::from_override(Some("awg1")).expect("valid override"),
+        );
+
+        // Monitoring-only: the installer's interface must not be reconciled,
+        // so the expired peer is left untouched and no removal is started.
+        poller
+            .cleanup_expired_users_step(&PanelMode::MonitoringOnly {
+                monitored: "awg1".into(),
+                installer: Some("awg0".into()),
+            })
+            .await;
+        assert_eq!(removal_pending(&db, id).await, 0);
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE action IN (?, ?)")
+                .bind(crate::db::events::EVT_USER_REMOVE_REQUESTED)
+                .bind(crate::db::events::EVT_USER_REMOVE_FAILED)
+                .fetch_one(&db.pool)
+                .await
+                .expect("count removal events");
+        assert_eq!(attempts, 0);
+
+        // Management mode starts the native removal (which cannot complete in
+        // the test environment) and therefore marks the retry state.
+        poller
+            .cleanup_expired_users_step(&PanelMode::Managing {
+                interface: "awg0".into(),
+            })
+            .await;
+        assert_eq!(removal_pending(&db, id).await, 1);
+    }
+
+    #[test]
+    fn scope_log_reports_mode_changes_once() {
+        let mut log = ScopeLog::default();
+        let managing = PanelMode::Managing {
+            interface: "awg0".into(),
+        };
+        let monitoring = PanelMode::MonitoringOnly {
+            monitored: "awg1".into(),
+            installer: Some("awg0".into()),
+        };
+
+        assert_eq!(log.observe_mode(&managing), Some(None));
+        assert_eq!(log.observe_mode(&managing), None);
+        assert_eq!(log.observe_mode(&monitoring), Some(Some(managing.clone())));
+        assert_eq!(log.observe_mode(&monitoring), None);
+        assert_eq!(log.observe_mode(&managing), Some(Some(monitoring)));
     }
 
     #[test]

@@ -49,9 +49,10 @@ pub struct Config {
     #[arg(long, env = "AWG_POLL_INTERVAL", default_value_t = 30)]
     pub poll_interval: u64,
 
-    /// AWG interface to monitor and manage.  Defaults to `SERVER_AWG_NIC`
-    /// from the installer params; set it only when this host runs several
-    /// AWG interfaces and the panel should follow a different one.
+    /// AWG interface to follow.  Defaults to `SERVER_AWG_NIC` from the
+    /// installer params; set it only when this host runs several AWG
+    /// interfaces and the panel should follow a different one.  Any other
+    /// interface than the installer's is monitored only.
     #[arg(long, env = "AWG_INTERFACE")]
     pub interface: Option<String>,
 
