@@ -42,6 +42,28 @@ assert_eq() {
 	fi
 }
 
+assert_contains() {
+	local NEEDLE="$1"
+	local HAYSTACK="$2"
+	local NAME="$3"
+	if [[ "${HAYSTACK}" == *"${NEEDLE}"* ]]; then
+		ok "${NAME}"
+	else
+		not_ok "${NAME} (expected to find '${NEEDLE}' in '${HAYSTACK}')"
+	fi
+}
+
+assert_not_contains() {
+	local NEEDLE="$1"
+	local HAYSTACK="$2"
+	local NAME="$3"
+	if [[ "${HAYSTACK}" != *"${NEEDLE}"* ]]; then
+		ok "${NAME}"
+	else
+		not_ok "${NAME} (found '${NEEDLE}' in '${HAYSTACK}')"
+	fi
+}
+
 # shellcheck source=../amneziawg-install.sh
 source "${PROJECT_ROOT}/amneziawg-install.sh"
 
@@ -59,7 +81,15 @@ case "${1:-}" in
 		printf '%s\n' 'cHVia2V5MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3A='
 		;;
 	setconf)
-		[[ "${AWG3_TEST_FAIL_SET:-0}" == "0" ]] || exit 1
+		if [[ "${AWG3_TEST_FAIL_SET:-0}" != "0" ]]; then
+			[[ -z "${AWG3_TEST_SETCONF_STDERR:-}" ]] || printf '%s\n' "${AWG3_TEST_SETCONF_STDERR}" >&2
+			exit 1
+		fi
+		# Like awg, refuse a line it does not know and quote it in the error.
+		if [[ -n "${AWG3_TEST_SETCONF_REJECT_LINE:-}" ]] && grep -qxF -- "${AWG3_TEST_SETCONF_REJECT_LINE}" "$3"; then
+			printf "Line unrecognized: \`%s'\nConfiguration parsing error\n" "${AWG3_TEST_SETCONF_REJECT_LINE}" >&2
+			exit 1
+		fi
 		if grep -q '^RandomTrailers = ' "$3"; then
 			[[ "${AWG31_TEST_FAIL_SET:-0}" == "0" ]] || exit 1
 		fi
@@ -91,6 +121,10 @@ chmod +x "${BIN_DIR}/awg"
 cat >"${BIN_DIR}/ip" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${AWG3_TEST_IP_LOG}"
+if [[ "${1:-}" == "link" && "${2:-}" == "delete" && "${AWG3_TEST_FAIL_LINK_DELETE:-0}" == "1" ]]; then
+	echo "RTNETLINK answers: Operation not permitted" >&2
+	exit 1
+fi
 if [[ "${1:-}" == "link" && "${2:-}" == "show" ]]; then
 	if [[ "${4:-}" == "${AWG3_TEST_SERVER_INTERFACE:-}" && \
 		-n "${AWG3_TEST_MANUAL_STATE:-}" && -e "${AWG3_TEST_MANUAL_STATE}" ]]; then
@@ -110,6 +144,10 @@ cat >"${BIN_DIR}/awg-quick" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
 	strip)
+		if [[ -n "${AWG3_TEST_STRIP_STDERR:-}" ]]; then
+			printf '%s\n' "${AWG3_TEST_STRIP_STDERR}" >&2
+			exit 1
+		fi
 		[[ -f "${2:-}" ]] || exit 1
 		[[ "$(basename -- "${2}")" =~ ^[a-zA-Z0-9_=+.-]{1,15}\.conf$ ]] || exit 1
 		sed -E '/^(Address|DNS|PostUp|PostDown)[[:space:]]*=/d' "$2"
@@ -476,6 +514,31 @@ else
 fi
 unset AWG3_TEST_FAIL_SET
 
+# A rejected probe configuration is explained with awg's own message, the key
+# line it quotes withheld, before the generic verdict.
+: >"${AWG3_TEST_IP_LOG}"
+AWG3_TEST_FAIL_SET=1
+printf -v AWG3_TEST_SETCONF_STDERR "Line unrecognized: \`HeaderProtectionKey = %s'\nConfiguration parsing error" "${MOCK_KEY}"
+export AWG3_TEST_FAIL_SET AWG3_TEST_SETCONF_STDERR
+PROBE_ERR="$(probeAwg3Capability "${MOCK_KEY}" 2>&1 >/dev/null || true)"
+unset AWG3_TEST_FAIL_SET AWG3_TEST_SETCONF_STDERR
+assert_contains "ERROR: awg setconf rejected the AWG 3.0 probe configuration:" "${PROBE_ERR}" \
+	"a rejected probe configuration names the step that rejected it"
+assert_contains "       Configuration parsing error" "${PROBE_ERR}" \
+	"and relays awg's own message"
+assert_contains "       (a line naming HeaderProtectionKey was withheld)" "${PROBE_ERR}" \
+	"withholding the quoted HeaderProtectionKey line"
+assert_not_contains "${MOCK_KEY}" "${PROBE_ERR}" "so the probe key is never printed"
+assert_contains "awg setconf rejected" "${PROBE_ERR%%"ERROR: AWG 3.0 is not supported"*}" \
+	"before the generic probe verdict"
+assert_contains "ERROR: AWG 3.0 is not supported by both the installed awg tool and the running kernel module" "${PROBE_ERR}" \
+	"which is still reported"
+if grep -q '^link delete dev awgp' "${AWG3_TEST_IP_LOG}"; then
+	ok "and the probe interface is still removed"
+else
+	not_ok "and the probe interface is still removed"
+fi
+
 : >"${AWG3_TEST_IP_LOG}"
 AWG3_TEST_CONTENT_READBACK="11-14"
 export AWG3_TEST_CONTENT_READBACK
@@ -690,6 +753,104 @@ else
 	not_ok "AWG 2.0 downgrade is byte-identical and recreates a manually active interface"
 fi
 unset AWG3_TEST_MANUAL_STATE
+
+# Issue 146: one client config carries a line the installed tooling cannot
+# parse. The staged copies are deleted with the transaction, so the failure
+# must name the step, the client and awg's message instead, and still end with
+# the generic verdict; the key material in the stripped configs stays private.
+UNPARSEABLE_CLIENT_BACKUP="${TEST_ROOT}/client-unparseable.backup"
+cp -p "${CLIENT_CONF}" "${UNPARSEABLE_CLIENT_BACKUP}"
+sed -i '/^\[Peer\]/i Jc2 = 5' "${CLIENT_CONF}"
+REJECTED_SERVER_BEFORE="$(sha256sum "${SERVER_AWG_CONF}")"
+REJECTED_PARAMS_BEFORE="$(sha256sum "${AMNEZIAWG_DIR}/params")"
+REJECTED_CLIENT_BEFORE="$(sha256sum "${CLIENT_CONF}")"
+AWG_PROTOCOL_VERSION=3
+AWG_HEADER_PROTECTION_KEY="${MOCK_KEY}"
+AWG_CONTENT_PADDING_ADDITION="${AWG3_DEFAULT_CONTENT_PADDING_ADDITION}"
+AWG_REKEY_AFTER_TIME="${AWG3_DEFAULT_REKEY_AFTER_TIME}"
+AWG_REKEY_TIMEOUT="${AWG3_DEFAULT_REKEY_TIMEOUT}"
+AWG_REJECT_AFTER_TIME="${AWG3_DEFAULT_REJECT_AFTER_TIME}"
+AWG_KEEPALIVE_TIMEOUT="${AWG3_DEFAULT_KEEPALIVE_TIMEOUT}"
+export AWG3_TEST_SETCONF_REJECT_LINE="Jc2 = 5"
+REJECTED_ERR="$(applyAwgProtocolTransaction 2>&1 >/dev/null)"
+REJECTED_RC=$?
+unset AWG3_TEST_SETCONF_REJECT_LINE
+assert_eq "1" "${REJECTED_RC}" "a client config the tooling cannot parse fails the protocol transaction"
+assert_contains "ERROR: awg setconf rejected client 1 'alice' ($(readlink -f -- "${CLIENT_CONF}")):" "${REJECTED_ERR}" \
+	"naming the step, the client and its config file"
+assert_contains "       Line unrecognized: \`Jc2 = 5'" "${REJECTED_ERR}" \
+	"and quoting awg's message about the offending line"
+assert_eq "ERROR: a staged protocol configuration was rejected by the installed tooling or running module" "${REJECTED_ERR##*$'\n'}" \
+	"with the generic verdict as the final line"
+assert_not_contains "${MOCK_KEY}" "${REJECTED_ERR}" "and no key material"
+assert_not_contains "client-0.conf" "${REJECTED_ERR}" "nor the anonymous staged copy"
+if [[ "$(sha256sum "${SERVER_AWG_CONF}")" == "${REJECTED_SERVER_BEFORE}" ]] && \
+	[[ "$(sha256sum "${AMNEZIAWG_DIR}/params")" == "${REJECTED_PARAMS_BEFORE}" ]] && \
+	[[ "$(sha256sum "${CLIENT_CONF}")" == "${REJECTED_CLIENT_BEFORE}" ]] && \
+	! compgen -G "${AMNEZIAWG_DIR}/.awg-protocol.*" >/dev/null; then
+	ok "a rejected staged config leaves every file unchanged and no transaction directory"
+else
+	not_ok "a rejected staged config leaves every file unchanged and no transaction directory"
+fi
+cp -p "${UNPARSEABLE_CLIENT_BACKUP}" "${CLIENT_CONF}"
+AWG_PROTOCOL_VERSION=2
+clearAwg3Params
+
+# The same report for the other validation steps, on private copies whose
+# names awg-quick strip accepts.
+VALIDATE_WORK="${TEST_ROOT}/validate-work"
+mkdir -p "${VALIDATE_WORK}"
+cp -p "${SERVER_AWG_CONF}" "${VALIDATE_WORK}/server.conf"
+cp -p "${CLIENT_CONF}" "${VALIDATE_WORK}/client-1.conf"
+
+: >"${AWG3_TEST_IP_LOG}"
+export AWG3_TEST_STRIP_STDERR="awg-quick: \`${MOCK_KEY}' is neither on nor off"
+STRIP_ERR="$(validateStagedAwgConfigs "${VALIDATE_WORK}" \
+	--label "the server configuration (${SERVER_AWG_CONF})" "${VALIDATE_WORK}/server.conf" 2>&1 >/dev/null || true)"
+unset AWG3_TEST_STRIP_STDERR
+assert_contains "ERROR: awg-quick strip rejected the server configuration (${SERVER_AWG_CONF}):" "${STRIP_ERR}" \
+	"a failed awg-quick strip names the step and the labelled file"
+assert_contains "       awg-quick: \`[redacted key]' is neither on nor off" "${STRIP_ERR}" \
+	"and relays its message with the key redacted"
+assert_eq "ERROR: a staged protocol configuration was rejected by the installed tooling or running module" "${STRIP_ERR##*$'\n'}" \
+	"ending with the generic verdict"
+if grep -q '^link delete dev awgv' "${AWG3_TEST_IP_LOG}"; then
+	ok "and the validation interface is still deleted"
+else
+	not_ok "and the validation interface is still deleted"
+fi
+
+AWG3_TEST_FAIL_SET=1
+export AWG3_TEST_FAIL_SET
+SILENT_ERR="$(validateStagedAwgConfigs "${VALIDATE_WORK}" "${VALIDATE_WORK}/client-1.conf" 2>&1 >/dev/null || true)"
+unset AWG3_TEST_FAIL_SET
+assert_contains "ERROR: awg setconf rejected ${VALIDATE_WORK}/client-1.conf:" "${SILENT_ERR}" \
+	"an unlabelled file is named by its path"
+assert_contains "       (the tool printed no message)" "${SILENT_ERR}" \
+	"and a tool that fails silently is reported as such"
+
+: >"${AWG3_TEST_IP_LOG}"
+export AWG3_TEST_FAIL_LINK_DELETE=1
+DELETE_ERR="$(validateStagedAwgConfigs "${VALIDATE_WORK}" "${VALIDATE_WORK}/server.conf" 2>&1 >/dev/null || true)"
+unset AWG3_TEST_FAIL_LINK_DELETE
+assert_contains "ERROR: could not delete the temporary AWG configuration-validation interface awgv" "${DELETE_ERR}" \
+	"a failed validation interface deletion names that step"
+assert_contains "       RTNETLINK answers: Operation not permitted" "${DELETE_ERR}" "with ip's message"
+assert_eq "ERROR: a staged protocol configuration was rejected by the installed tooling or running module" "${DELETE_ERR##*$'\n'}" \
+	"and the generic verdict last"
+
+REDACTED="$(redactAwgKeyMaterial <<EOF
+Line unrecognized: \`PrivateKey = ${MOCK_KEY}'
+Key is not the correct length or format: \`abc'
+PublicKey = ${EXPECTED_CLIENT_PUB}
+Unable to modify interface: Invalid argument
+EOF
+)"
+assert_eq "(a line naming PrivateKey was withheld)
+(a line quoting a malformed key was withheld)
+PublicKey = [redacted key]
+Unable to modify interface: Invalid argument" "${REDACTED}" \
+	"redactAwgKeyMaterial withholds key lines and masks every base64 key"
 
 SERVER_BEFORE="$(sha256sum "${SERVER_AWG_CONF}")"
 PARAMS_BEFORE="$(sha256sum "${AMNEZIAWG_DIR}/params")"
