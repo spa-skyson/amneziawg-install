@@ -86,7 +86,7 @@ struct CachedSystemVersions {
 /// The most recent failed protocol migration, kept in memory so the page the
 /// confirmed form redirects to can show what the installer reported. Only the
 /// diagnostics the privileged helper relayed are kept: a bounded, sanitized
-/// tail of the installer's stderr with key material withheld.
+/// tail of the installer's vetted diagnostic channel with key material withheld.
 #[derive(Debug, Clone)]
 struct ProtocolFailure {
     operation: &'static str,

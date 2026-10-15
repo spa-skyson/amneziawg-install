@@ -342,9 +342,13 @@ no shell interpolation.
 Protocol migration is also routed through the helper. It resolves only the
 root-owned lifecycle script recorded beside the service's configured
 environment file, accepts only fixed enable/disable operations, and discards the
-script's stdout. When a migration fails, the helper relays a bounded tail of the
-script's stderr after its own failure line, with terminal escapes stripped,
-key-shaped values masked, and lines quoting key assignments withheld; the panel
+script's ordinary stdout and stderr. Compatible installers report vetted failure
+context and redacted probe/validation messages through a separate diagnostic
+descriptor, which is closed around hook-running commands. When a migration fails,
+the helper relays a bounded tail of that channel after its own failure line, with
+terminal escapes stripped, key-shaped values masked, and lines quoting key
+assignments withheld. Older installers still run, but return only the generic
+failure notice. Hook output is excluded from these diagnostics. The panel
 shows those lines under the failure notice, records them in the audit log as an
 `awg_protocol_change_failed` event, and writes them to the service journal, so
 the operator can see which staged file or step the installer rejected.

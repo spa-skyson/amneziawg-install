@@ -36,6 +36,7 @@ jobs:
           bash -n tests/test-web-imitation.sh
           bash -n tests/test-web-protocol-options.sh
           bash -n tests/test-web-protocol-diagnostics.sh
+          bash -n tests/test-web-protocol-private-output.sh
           bash -n tests/test-boringtun-artifact.sh
           bash -n tests/test-boringtun-release.sh
           bash -n tests/test-boringtun-foreground-launcher.sh
@@ -87,7 +88,9 @@ jobs:
         run: bash tests/test-web-protocol-options.sh
 
       - name: Web protocol diagnostics regression
-        run: bash tests/test-web-protocol-diagnostics.sh
+        run: |
+          bash tests/test-web-protocol-diagnostics.sh
+          bash tests/test-web-protocol-private-output.sh
 
       - name: BoringTun read-only helper regression
         run: bash tests/test-boringtun-managed-files.sh
@@ -124,6 +127,7 @@ jobs:
           shellcheck --severity=warning tests/test-web-imitation.sh
           shellcheck --severity=warning tests/test-web-protocol-options.sh
           shellcheck --severity=warning tests/test-web-protocol-diagnostics.sh
+          shellcheck --severity=warning tests/test-web-protocol-private-output.sh
           shellcheck --severity=warning tests/test-boringtun-artifact.sh
           shellcheck --severity=warning tests/test-boringtun-release.sh
           shellcheck --severity=warning tests/test-boringtun-foreground-launcher.sh

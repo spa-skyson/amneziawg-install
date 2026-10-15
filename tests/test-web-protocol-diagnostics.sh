@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Test that the panel helper relays a bounded, sanitized tail of the
-# installer's stderr after a failed protocol migration, and nothing on success.
+# Test the bounded trusted diagnostic channel, including private capture,
+# cleanup, older installers and silence after successful migrations.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
@@ -27,15 +27,18 @@ KEY='A/b+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
 LONG="$(head -c 300 /dev/zero | tr '\0' x)"
 cat > "$WORK/mock-installer.sh" <<MOCK
 #!/usr/bin/env bash
+AWG_INSTALLER_CAPABILITY_PROTOCOL_DIAGNOSTICS="protocol-diagnostics-v1"
+stat -Lc '%a' /proc/self/fd/3 > '${WORK}/capture-mode'
 printf 'stdout must never be relayed\n'
-for i in \$(seq 1 20); do printf 'line %02d\n' "\$i" >&2; done
-printf '\033[0;31mERROR: awg setconf rejected the server configuration\033[0m\n' >&2
-printf 'PrivateKey = ${KEY}\n' >&2
-printf 'Line unrecognized: \`HeaderProtectionKey = ${KEY}\`\n' >&2
-printf 'Key is not the correct length or format: \`short\`\n' >&2
-printf 'public key ${KEY} was rejected\r\n' >&2
-printf '${LONG}\n' >&2
-printf 'ERROR: a staged protocol configuration was rejected by the installed tooling or running module\n' >&2
+printf 'installer: ERROR: raw-stderr-secret\n' >&2
+for i in \$(seq 1 20); do printf 'line %02d\n' "\$i" >&3; done
+printf '\033[0;31mERROR: awg setconf rejected the server configuration\033[0m\n' >&3
+printf 'PrivateKey = ${KEY}\n' >&3
+printf 'Line unrecognized: \`HeaderProtectionKey = ${KEY}\`\n' >&3
+printf 'Key is not the correct length or format: \`short\`\n' >&3
+printf 'public key ${KEY} was rejected\r\n' >&3
+printf '${LONG}\n' >&3
+printf 'ERROR: a staged protocol configuration was rejected by the installed tooling or running module\n' >&3
 exit 1
 MOCK
 chmod +x "$WORK/mock-installer.sh"
@@ -43,6 +46,8 @@ chmod +x "$WORK/mock-installer.sh"
 rc="$(run_helper enable-awg31)"
 [[ "$rc" == 2 ]] || fail_test "expected exit 2 from a failed migration, got $rc"
 [[ ! -s "$WORK/stdout" ]] || fail_test 'helper wrote to stdout on failure'
+[[ "$(cat "$WORK/capture-mode")" == 600 ]] || fail_test 'diagnostic capture was not private'
+! grep -q 'raw-stderr-secret' "$WORK/stderr" || fail_test 'raw installer stderr was relayed'
 [[ "$(head -n 1 "$WORK/stderr")" == 'amneziawg-web-privileged: protocol migration failed' ]] \
     || fail_test 'first stderr line is not the fixed failure line'
 relayed="$(grep -c '^installer: ' "$WORK/stderr" || true)"
@@ -67,18 +72,49 @@ grep -qx 'installer: line 13' "$WORK/stderr" || fail_test 'tail dropped a line t
 [[ -z "$(find "$WORK" -maxdepth 1 -name 'amneziawg-web-migration.*' -print -quit)" ]] \
     || fail_test 'captured stderr file was left behind'
 
-printf '#!/usr/bin/env bash\nexit 3\n' > "$WORK/mock-installer.sh"
+cat > "$WORK/mock-installer.sh" <<'MOCK'
+#!/usr/bin/env bash
+# No capability marker: older installers must still migrate, but raw output
+# and any descriptor inherited by their hooks must never reach the panel.
+printf '%s\n' "$1" > "$TMPDIR/legacy-flag"
+printf 'installer: ERROR: legacy-hook-secret\n' >&2
+printf 'legacy-descriptor-secret\n' >&3
+exit 3
+MOCK
 rc="$(run_helper disable-awg3)"
+[[ "$rc" == 2 ]] || fail_test "expected exit 2 from a legacy failure, got $rc"
+[[ "$(cat "$WORK/legacy-flag")" == --disable-awg3 ]] || fail_test 'legacy installer did not receive the migration flag'
+[[ "$(wc -l < "$WORK/stderr")" == 1 ]] || fail_test 'a legacy installer failure relayed untrusted lines'
+[[ -z "$(find "$WORK" -maxdepth 1 -name 'amneziawg-web-migration.*' -print -quit)" ]] \
+    || fail_test 'diagnostic file was left behind after a legacy failure'
+
+cat > "$WORK/mock-installer.sh" <<'MOCK'
+#!/usr/bin/env bash
+AWG_INSTALLER_CAPABILITY_PROTOCOL_DIAGNOSTICS="protocol-diagnostics-v1"
+exit 3
+MOCK
+rc="$(run_helper enable-awg31)"
 [[ "$rc" == 2 ]] || fail_test "expected exit 2 from a silent failure, got $rc"
 [[ "$(wc -l < "$WORK/stderr")" == 1 ]] || fail_test 'a silent installer failure relayed lines'
 [[ -z "$(find "$WORK" -maxdepth 1 -name 'amneziawg-web-migration.*' -print -quit)" ]] \
-    || fail_test 'captured stderr file was left behind after a silent failure'
+    || fail_test 'diagnostic file was left behind after a silent failure'
 
-printf '#!/usr/bin/env bash\nprintf "WARNING: harmless\n" >&2\nexit 0\n' > "$WORK/mock-installer.sh"
+cat > "$WORK/mock-installer.sh" <<'MOCK'
+#!/usr/bin/env bash
+AWG_INSTALLER_CAPABILITY_PROTOCOL_DIAGNOSTICS="protocol-diagnostics-v1"
+printf 'WARNING: harmless\n' >&2
+printf 'WARNING: trusted but successful\n' >&3
+exit 0
+MOCK
 rc="$(run_helper enable-awg31)"
 [[ "$rc" == 0 ]] || fail_test "expected exit 0 from a successful migration, got $rc"
 [[ ! -s "$WORK/stderr" && ! -s "$WORK/stdout" ]] || fail_test 'a successful migration produced output'
 [[ -z "$(find "$WORK" -maxdepth 1 -name 'amneziawg-web-migration.*' -print -quit)" ]] \
     || fail_test 'captured stderr file was left behind after success'
+
+printf '#!/usr/bin/env bash\nprintf "legacy output\\n" >&2\nexit 0\n' > "$WORK/mock-installer.sh"
+rc="$(run_helper disable-awg3)"
+[[ "$rc" == 0 ]] || fail_test "expected exit 0 from a successful legacy migration, got $rc"
+[[ ! -s "$WORK/stderr" && ! -s "$WORK/stdout" ]] || fail_test 'a successful legacy migration produced output'
 
 echo 'PASS: panel helper relays sanitized installer diagnostics on failure only'
