@@ -1,8 +1,7 @@
 //! Config-file discovery and metadata extraction.
 //!
 //! Scans a directory for `*.conf` files (AWG client configs), extracts
-//! basic metadata, and attempts to map each config to a live peer via its
-//! `PublicKey`.
+//! basic metadata for server ownership checks and client-address matching.
 //!
 //! ## Discovery rules
 //!
@@ -46,11 +45,46 @@ pub struct ClientConfig {
     /// Public key extracted from the `[Peer]` section of the config.
     ///
     /// In a split-tunnel AWG client config the `[Peer]` section describes the
-    /// **server** endpoint.  The `PublicKey` value there matches what
-    /// `awg show` reports for this client peer.
+    /// **server** endpoint, not this client's public key.
     pub peer_public_key: Option<PublicKey>,
     /// Address(es) from the `[Interface]` `Address` field.
     pub addresses: Vec<String>,
+}
+
+impl ClientConfig {
+    pub fn from_content(path: PathBuf, content: &str) -> Self {
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        Self {
+            friendly_name: friendly_name_from_filename(&name),
+            name,
+            path,
+            peer_public_key: extract_peer_public_key(content),
+            addresses: extract_addresses(content),
+        }
+    }
+
+    pub(crate) fn belongs_to(&self, scope: &crate::managed_interface::ConfigScope) -> bool {
+        // The server key is authoritative even for arbitrarily named files.
+        // Installer-style filenames add an explicit interface constraint.
+        self.peer_public_key.as_ref().map(|key| key.0.as_str())
+            == Some(scope.server_public_key.as_str())
+            && (!self.name.contains("-client-")
+                || self
+                    .name
+                    .starts_with(&format!("{}-client-", scope.mode.interface())))
+    }
+
+    pub fn matches_addresses(&self, allowed_ips: &str) -> bool {
+        self.addresses.iter().any(|address| {
+            allowed_ips
+                .split(',')
+                .any(|allowed| address.split('/').next() == allowed.trim().split('/').next())
+        })
+    }
 }
 
 /// Derive a human-readable "friendly" name from a config filename stem.
@@ -106,23 +140,7 @@ pub fn scan(dir: &Path) -> Result<Vec<ClientConfig>, ConfigStoreError> {
             }
         };
 
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-
-        let friendly_name = friendly_name_from_filename(&name);
-        let peer_public_key = extract_peer_public_key(&content);
-        let addresses = extract_addresses(&content);
-
-        configs.push(ClientConfig {
-            name,
-            friendly_name,
-            path,
-            peer_public_key,
-            addresses,
-        });
+        configs.push(ClientConfig::from_content(path, &content));
     }
 
     Ok(configs)

@@ -111,7 +111,8 @@ binary via `sqlx::migrate!("./migrations")`.
 ### `poller` module (`src/poller/`)
 
 A Tokio background task that wakes every `AWG_POLL_INTERVAL` seconds,
-calls `awg::show_all_dump()`, and:
+calls `awg::show_all_dump()`, keeps only the managed interface
+(`AWG_INTERFACE`, else `SERVER_AWG_NIC` from the installer params), and:
 
 1. Removes due managed users through the same native lifecycle command used
    by manual deletion. The first pass runs immediately at service startup.
@@ -147,7 +148,8 @@ These will be wired up to web handlers in a later milestone.
 2. Calls awg::show_all_dump()
    → executes: /usr/bin/sudo -n /usr/local/libexec/amneziawg-web-privileged show-all
 3. Helper validates `show-all` and executes: /usr/bin/awg show all dump
-4. Parses output into Vec<AwgInterface>
+4. Parses output into Vec<AwgInterface> and drops every interface except
+   the managed one (AWG_INTERFACE, else SERVER_AWG_NIC from the params)
 5. For each peer:
    a. conditionally INSERT INTO snapshots when the key is not archived
    b. UPSERT live fields only when the existing row is not archived
