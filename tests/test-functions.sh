@@ -669,7 +669,7 @@ _check_loaded_mtu() (
 		legacy|legacy-state) sed -i '/^CLIENT_MTU=/d' "${dir}/params";;
 		invalid) printf "CLIENT_MTU='1279'\n" >>"${dir}/params";;
 	esac
-	printf '[Interface]\nAddress = 10.66.66.1/24\n' >"${dir}/awg0.conf"
+	printf '[Interface]\nAddress = 10.66.66.1/24\nPrivateKey = %s\n' "${SERVER_PRIV_KEY}" >"${dir}/awg0.conf"
 	# This suite is unprivileged; fake ownership only, retaining real mode checks.
 	stat() { if [[ "$1" == -c && "$2" == %u ]]; then echo 0; else command stat "$@"; fi; }
 	CLIENT_MTU=1420
@@ -711,9 +711,10 @@ _check_install_mtu() ( # <mode> <value> [S4] [endpoint]
 	dir="$(mktemp -d)"
 	trap 'rm -rf "${dir}"' EXIT
 	# Only host discovery and the random S3/S4 are mocked; all prompts,
-	# validation and persistence run.
+	# validation and persistence run. No AmneziaWG config or link exists yet.
+	AMNEZIAWG_DIR="${dir}"
 	detectPublicIPv4() { echo 198.51.100.1; }
-	ip() { echo 'default via 198.51.100.254 dev eth0'; }
+	ip() { [[ "$1" != link ]] || return 1; echo 'default via 198.51.100.254 dev eth0'; }
 	ipv6Available() { return 1; }
 	generateS3AndS4() { RANDOM_AWG_S3=45; RANDOM_AWG_S4="${s4}"; }
 	AUTO_INSTALL="${mode}"
@@ -771,6 +772,236 @@ assert_eq unchanged "$(cat "${MTU_PARAMS}")" "invalid MTU does not truncate para
 rm -f "${MTU_PARAMS}"
 rmdir "${MTU_PARAMS_DIR}"
 unset MTU_PARAMS MTU_PARAMS_DIR MTU_VALUE MTU_RC MTU_SAFE_PARAMS
+
+echo "=== fresh install refuses an interface in use (#158) ==="
+# A hand-made tunnel, here a config holding someone else's key or a live link,
+# must never become the server a fresh installation writes. Result: exit code |
+# chosen interface | "in use" notes on stdout | the ERROR line on failure.
+# Mode y is an automatic install with SERVER_AWG_NIC set to NIC, or unset when
+# NIC is -; mode n an interactive one answering NIC (lines tried in turn) at
+# the interface prompt. CONFIGS and LINKS name the awgN configs and network
+# links that already exist.
+_check_install_nic() ( # <mode> <NIC> <configs> <links>
+	local mode="$1" nic="$2" configs="$3" links="$4" dir name answers rc=0
+	dir="$(mktemp -d)"
+	trap 'rm -rf "${dir}"' EXIT
+	AMNEZIAWG_DIR="${dir}/amneziawg"
+	mkdir -p "${AMNEZIAWG_DIR}"
+	for name in ${configs}; do
+		printf '[Interface]\nPrivateKey = HANDMADE\n' >"${AMNEZIAWG_DIR}/${name}.conf"
+	done
+	detectPublicIPv4() { echo 198.51.100.1; }
+	# ip link show dev NAME succeeds for the given links only.
+	ip() {
+		if [[ "$1" == link ]]; then
+			[[ " ${links} " == *" $4 "* ]]
+			return
+		fi
+		echo 'default via 198.51.100.254 dev eth0'
+	}
+	ipv6Available() { return 1; }
+	unset CLIENT_MTU
+	AUTO_INSTALL="${mode}"
+	SERVER_PUB_IP=198.51.100.1
+	SERVER_AWG_NIC="${nic}"
+	[[ "${nic}" != - ]] || unset SERVER_AWG_NIC
+	answers=$'198.51.100.1\neth0\n'"${nic}"$'\n10.66.66.1\nn\n51820\n1.1.1.1\n\n0.0.0.0/0\n4\n50\n1000\n30\n100\n45\n120\n1300\n5-10\n11-20\n21-30\n31-40\ny\n'
+	(
+		installQuestions >"${dir}/stdout" 2>"${dir}/stderr" <<<"${answers}" || exit 1
+		printf '%s' "${SERVER_AWG_NIC}" >"${dir}/nic"
+	) || rc=$?
+	printf '%s|%s|%s' "${rc}" "$(cat "${dir}/nic" 2>/dev/null)" \
+		"$(sed 's/\x1b\[[0-9;]*m//g' "${dir}/stdout" | grep -v '^ERROR' | grep -c 'in use' || true)"
+	# Nothing the installer found may change.
+	for name in ${configs}; do
+		[[ "$(cat "${AMNEZIAWG_DIR}/${name}.conf")" == $'[Interface]\nPrivateKey = HANDMADE' ]] || printf '|%s.conf changed' "${name}"
+	done
+	if [[ "${rc}" -ne 0 ]]; then
+		printf '|%s' "$(sed 's/\x1b\[[0-9;]*m//g' "${dir}/stdout" | grep '^ERROR' | sed "s|${AMNEZIAWG_DIR}|DIR|g")"
+	fi
+)
+assert_eq "1||0|ERROR: SERVER_AWG_NIC=awg0 is in use: DIR/awg0.conf already exists. A fresh installation would overwrite it." \
+	"$(_check_install_nic y awg0 awg0 '')" "automatic install refuses an explicit interface whose config exists"
+assert_eq "1||0|ERROR: SERVER_AWG_NIC=awg0 is in use: a network interface named awg0 already exists. A fresh installation would overwrite it." \
+	"$(_check_install_nic y awg0 '' awg0)" "automatic install refuses an explicit interface whose link exists"
+assert_eq "0|awg1|0" "$(_check_install_nic y awg1 awg0 '')" "automatic install takes an explicit free interface next to a hand-made one"
+assert_eq "0|awg1|1" "$(_check_install_nic y - awg0 '')" "automatic install defaults to the first free awgN and says why"
+assert_eq "0|awg2|1" "$(_check_install_nic y - awg0 awg1)" "automatic install default skips configs and links alike"
+assert_eq "0|awg0|0" "$(_check_install_nic y - '' '')" "automatic install defaults to awg0 on a clean host"
+assert_eq "0|awg1|2" "$(_check_install_nic n $'awg0\nawg1' awg0 '')" "interactive install refuses an interface whose config exists and asks again"
+assert_eq "0|awg2|2" "$(_check_install_nic n $'awg1\nawg2' '' 'awg0 awg1')" "interactive install refuses an interface whose link exists and asks again"
+assert_eq "0|awg0|0" "$(_check_install_nic n awg0 '' '')" "interactive install takes awg0 on a clean host"
+
+# The interactive prompt offers the first free awgN.
+_first_free_nic() ( # <configs> <links>
+	local dir name links="$2"
+	dir="$(mktemp -d)"
+	trap 'rm -rf "${dir}"' EXIT
+	AMNEZIAWG_DIR="${dir}"
+	for name in $1; do : >"${dir}/${name}.conf"; done
+	ip() { [[ " ${links} " == *" $4 "* ]]; }
+	firstFreeAwgInterfaceName
+)
+assert_eq awg0 "$(_first_free_nic '' '')" "first free interface on a clean host"
+assert_eq awg1 "$(_first_free_nic awg0 '')" "first free interface skips an existing config"
+assert_eq awg2 "$(_first_free_nic awg1 awg0)" "first free interface skips an existing link"
+
+# The last line of defence: writing the state of a fresh installation never
+# replaces an existing config, and generates no keys or params for it.
+_check_install_state_keeps_config() (
+	local dir
+	dir="$(mktemp -d)"
+	trap 'rm -rf "${dir}"' EXIT
+	AMNEZIAWG_DIR="${dir}"; SERVER_AWG_NIC=awg0
+	printf '[Interface]\nPrivateKey = HANDMADE\n' >"${dir}/awg0.conf"
+	awg() { echo "awg $*" >>"${dir}/awg-calls"; }
+	( writeAwgServerInstallState >/dev/null 2>&1 ) && exit 1
+	[[ "$(cat "${dir}/awg0.conf")" == $'[Interface]\nPrivateKey = HANDMADE' && ! -e "${dir}/params" && ! -e "${dir}/awg-calls" ]] || exit 1
+	echo kept
+)
+assert_eq kept "$(_check_install_state_keeps_config)" "writeAwgServerInstallState refuses to overwrite an existing config"
+
+echo "=== management refuses a config that is not the managed server (#158) ==="
+_conf_private_key() { # <config text>
+	local file rc=0
+	file="$(mktemp)"
+	printf '%b' "$1" >"${file}"
+	awgConfigInterfacePrivateKey "${file}" || rc=$?
+	rm -f "${file}"
+	return "${rc}"
+}
+assert_eq SRVPRIV "$(_conf_private_key '[Interface]\nAddress = 10.66.66.1/24\nPrivateKey = SRVPRIV\n')" "server private key is read from [Interface]"
+assert_eq SRVPRIV "$(_conf_private_key ' [interface] \n\tprivatekey=SRVPRIV # comment\n')" "key names in any case, whitespace and comments are ignored"
+assert_eq SRVPRIV "$(_conf_private_key '[Interface]\nPrivateKey = OLD\nPrivateKey = SRVPRIV\n')" "the last PrivateKey wins"
+assert_eq "" "$(_conf_private_key '[Interface]\nAddress = 10.66.66.1/24\n\n[Peer]\nPrivateKey = PEER\n')" "a PrivateKey outside [Interface] does not count"
+assert_eq "" "$(_conf_private_key '')" "an empty config has no private key"
+
+# Result: validateParamsFile exit code | ERROR lines on stderr | ERROR lines on
+# the web panel's protocol diagnostic channel. The config is awg0.conf with the
+# given [Interface] text; params hold SERVER_PRIV_KEY=SRVPRIV.
+_check_managed_config() ( # <config text>
+	local dir rc=0
+	dir="$(mktemp -d)"
+	trap 'rm -rf "${dir}"' EXIT
+	AMNEZIAWG_DIR="${dir}"; SERVER_AWG_NIC=awg0; SERVER_PRIV_KEY=SRVPRIV
+	serializeParams "${dir}/params" || exit 1
+	printf '%b' "$1" >"${dir}/awg0.conf"
+	# This suite is unprivileged; fake ownership only, retaining real mode checks.
+	stat() { if [[ "$1" == -c && "$2" == %u ]]; then echo 0; else command stat "$@"; fi; }
+	unset SERVER_PRIV_KEY
+	AWG_INSTALLER_PROTOCOL_DIAGNOSTICS=1 validateParamsFile >/dev/null 2>"${dir}/stderr" 3>"${dir}/diagnostics" || rc=$?
+	if grep -q SRVPRIV "${dir}/stderr" "${dir}/diagnostics"; then
+		echo "the private key was printed"
+		return
+	fi
+	printf '%s|%s|%s' "${rc}" \
+		"$(sed 's/\x1b\[[0-9;]*m//g' "${dir}/stderr" | grep -c '^ERROR: .*/awg0.conf is not the AmneziaWG server this installer manages' || true)" \
+		"$(grep -c '^ERROR: .*/awg0.conf is not the AmneziaWG server this installer manages' "${dir}/diagnostics" || true)"
+)
+assert_eq "0|0|0" "$(_check_managed_config '[Interface]\nAddress = 10.66.66.1/24\nPrivateKey = SRVPRIV\n')" "the managed server config loads"
+assert_eq "1|1|1" "$(_check_managed_config '[Interface]\nAddress = 10.0.0.2/32\nPrivateKey = UPSTREAM\n\n[Peer]\nPublicKey = UPSTREAMPUB\nAllowedIPs = 0.0.0.0/0\n')" "another tunnel's config is refused"
+assert_eq "1|1|1" "$(_check_managed_config '[Interface]\nAddress = 10.66.66.1/24\n')" "a config without a private key is refused"
+
+# Client lifecycle entry points against a two-hop server whose params name the
+# upstream tunnel's config. Result: exit code | the config is unchanged | the
+# client config was written | the refusal was printed.
+NIAC_MANAGED_BIN="$(mktemp -d)"
+printf '#!/usr/bin/env bash\ncase "$1" in genkey) echo PRIVKEY;; pubkey) read -r _; echo PUBKEY;; genpsk) echo PSK;; esac\n' >"${NIAC_MANAGED_BIN}/awg"
+printf '#!/usr/bin/env bash\necho "[Interface]"\n' >"${NIAC_MANAGED_BIN}/awg-quick"
+chmod +x "${NIAC_MANAGED_BIN}/awg" "${NIAC_MANAGED_BIN}/awg-quick"
+_check_managed_client_add() ( # <config private key> <noninteractive|interactive>
+	local dir rc=0 before
+	dir="$(mktemp -d)"
+	trap 'rm -rf "${dir}"' EXIT
+	PATH="${NIAC_MANAGED_BIN}:${PATH}"
+	AMNEZIAWG_DIR="${dir}/amneziawg"
+	WEB_PANEL_CONFIG_DIR="${dir}/lock"
+	WEB_PANEL_ENV_FILE="${dir}/missing-env.conf"
+	WEB_PANEL_SYSTEMD_UNIT="${dir}/missing.service"
+	mkdir -p "${AMNEZIAWG_DIR}" "${WEB_PANEL_CONFIG_DIR}"
+	SERVER_AWG_NIC=awg0; SERVER_PRIV_KEY=SRVPRIV; SERVER_AWG_IPV6="fd42:42:42:0:0:0:0:1"
+	CLIENT_MTU=""; ENABLE_IPV6=n
+	serializeParams "${AMNEZIAWG_DIR}/params" || exit 1
+	printf '[Interface]\nAddress = 10.66.66.1/24\nListenPort = 51820\nPrivateKey = %s\n' "$1" >"${AMNEZIAWG_DIR}/awg0.conf"
+	before="$(cat "${AMNEZIAWG_DIR}/awg0.conf")"
+	stat() { if [[ "$1" == -c && "$2" == %u ]]; then echo 0; else command stat "$@"; fi; }
+	ensureAwgBackendReady() { :; }
+	copyToWebPanelDir() { :; }
+	getHomeDirForClient() { echo "${AMNEZIAWG_DIR}/clients"; }
+	mkdir -p "${AMNEZIAWG_DIR}/clients"
+	case "$2" in
+		noninteractive) nonInteractiveAddClient bob >"${dir}/stdout" 2>"${dir}/stderr" || rc=$?;;
+		interactive)
+			AUTO_INSTALL=y
+			runLockedManagementOperation newClient >"${dir}/stdout" 2>"${dir}/stderr" </dev/null || rc=$?
+			;;
+	esac
+	printf '%s|%s|%s|%s' "${rc}" \
+		"$([[ "$(cat "${AMNEZIAWG_DIR}/awg0.conf")" == "${before}" ]] && echo unchanged || echo changed)" \
+		"$(compgen -G "${AMNEZIAWG_DIR}/clients/awg0-client-*.conf" >/dev/null && echo written || echo none)" \
+		"$(grep -c 'is not the AmneziaWG server this installer manages' "${dir}/stderr" || true)"
+)
+assert_eq "1|unchanged|none|1" "$(_check_managed_client_add UPSTREAM noninteractive)" "--add-client refuses a config that is not the managed server"
+assert_eq "1|unchanged|none|1" "$(_check_managed_client_add UPSTREAM interactive)" "menu client add refuses a config that is not the managed server"
+assert_eq "0|changed|written|0" "$(_check_managed_client_add SRVPRIV noninteractive)" "--add-client still adds a client to the managed server"
+assert_eq "0|changed|written|0" "$(_check_managed_client_add SRVPRIV interactive)" "menu client add still adds a client to the managed server"
+rm -rf "${NIAC_MANAGED_BIN}"
+unset NIAC_MANAGED_BIN
+
+echo "=== uninstall removes only the installation's own configuration ==="
+# The managed interface is awg1. Each argument is an entry to create in the
+# config directory (a trailing / makes a directory with a file in it); the
+# first names the entry whose removal fails, or is empty. Result: exit code |
+# what is left in the directory, or "gone" | "left in place" notes.
+_check_remove_config() ( # <entry rm fails on, or ""> <entry...>
+	local fail="$1" dir entry rc=0
+	shift
+	dir="$(mktemp -d)"
+	trap 'rm -rf "${dir}"' EXIT
+	AMNEZIAWG_DIR="${dir}/amneziawg"; SERVER_AWG_NIC=awg1
+	mkdir -p "${AMNEZIAWG_DIR}"
+	for entry in "$@"; do
+		case "${entry}" in
+			*/) mkdir -p "${AMNEZIAWG_DIR}/${entry}" && : >"${AMNEZIAWG_DIR}/${entry}file" ;;
+			*) printf 'x\n' >"${AMNEZIAWG_DIR}/${entry}" ;;
+		esac
+	done
+	if [[ -n "${fail}" ]]; then
+		eval "rm() { [[ \"\${*: -1}\" == '${AMNEZIAWG_DIR}/${fail}' ]] && return 1; command rm \"\$@\"; }"
+	fi
+	removeAwgInstallConfig >"${dir}/out" 2>&1 || rc=$?
+	printf '%s|%s|%s' "${rc}" \
+		"$(if [[ -d "${AMNEZIAWG_DIR}" ]]; then LC_ALL=C ls -A "${AMNEZIAWG_DIR}" | tr '\n' ' '; else echo gone; fi)" \
+		"$(grep -c 'left in place' "${dir}/out" || true)"
+)
+# Every name the installation writes there, with mktemp's six characters.
+REMOVE_CONFIG_OWN=(params params.bak params.tmp.Ab12Cd params.Cd34Ef .params.protocol.Ef56Gh .params.imitation.Gh78Ij
+	awg1.conf awg1.conf.bak awg1.conf.tmp.Ef56Gh .awg1.conf.protocol.Ij90Kl .awg1.conf.imitation.Kl12Mn
+	awg1.boringtun .awg1.boringtun.Mn34Op .awg1.boringtun.imitation.Op56Qr clients/ .awg1.web.lock .awg1.sync.Gh78Ij
+	.awg-protocol.Ij90Kl/ .awg-imitation.Kl12Mn/)
+assert_eq "0|gone|0" "$(_check_remove_config '' "${REMOVE_CONFIG_OWN[@]}")" \
+	"uninstall removes every entry of its own and then the directory"
+assert_eq "0|.awg0.web.lock awg0.conf awg0.conf.bak awg1.1.conf awg10.conf notes |1" \
+	"$(_check_remove_config '' "${REMOVE_CONFIG_OWN[@]}" awg0.conf awg0.conf.bak .awg0.web.lock awg10.conf awg1.1.conf notes)" \
+	"uninstall leaves another tunnel's config, its files and the directory, and says so"
+# Interface names may contain dots: params.conf and awg1.conf.conf are the
+# configs of interfaces named params and awg1.conf, never the installation's.
+# (A six-character suffix, as in params.backup, is the shape of a mktemp copy.)
+REMOVE_CONFIG_FOREIGN=(params.conf params.Ab12Cd.conf awg1.conf.conf awg1.conf.bak.conf awg1.boringtun.conf
+	.awg1.web.conf clients.conf params.old awg1.conf.orig .awg-protocol.x .params.protocol.short)
+assert_eq "0|$(printf '%s\n' "${REMOVE_CONFIG_FOREIGN[@]}" | LC_ALL=C sort | tr '\n' ' ')|1" \
+	"$(_check_remove_config '' "${REMOVE_CONFIG_OWN[@]}" "${REMOVE_CONFIG_FOREIGN[@]}")" \
+	"uninstall removes only the exact names it writes, never configs whose names merely start with them"
+# A failure keeps params with the server config, so the next run of the
+# installer loads the installation again and reruns the uninstall.
+assert_eq "1|awg1.conf clients params |0" "$(_check_remove_config clients params awg1.conf awg1.boringtun clients/)" \
+	"a client directory that cannot be removed keeps params and the server config for a rerun"
+assert_eq "1|awg1.conf params |0" "$(_check_remove_config awg1.conf params awg1.conf awg1.boringtun)" \
+	"a server config that cannot be removed keeps params for a rerun"
+assert_eq "1|params |0" "$(_check_remove_config params params awg1.conf)" \
+	"params that cannot be removed fail the removal"
+assert_eq "0|gone|0" "$(_check_remove_config '')" "an empty config directory is removed"
+unset REMOVE_CONFIG_OWN REMOVE_CONFIG_FOREIGN
 
 echo "=== formatClientAllowedIPs ==="
 assert_eq "0.0.0.0/0, ::/0" "$(formatClientAllowedIPs "0.0.0.0/0,::/0")" "formatClientAllowedIPs adds space after comma"

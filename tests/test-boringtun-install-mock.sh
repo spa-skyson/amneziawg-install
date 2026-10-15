@@ -155,11 +155,13 @@ case "$1" in
 esac
 exit 0'
 mock awg-quick '[[ "$1" == strip ]] && printf "[Interface]\nListenPort = 51820\n"; exit 0'
+# An AmneziaWG link exists once its config does; a fresh install refuses one.
 mock ip '
 case "$1$2" in
 	-4route) echo "default via 198.51.100.254 dev eth0" ;;
 	-6route) echo "default via 2001:db8::ffff dev eth0" ;;
 	-4addr) echo "    inet 198.51.100.1/24 scope global eth0" ;;
+	linkshow) [[ -e "/etc/amnezia/amneziawg/${4:-}.conf" ]]; exit ;;
 esac
 exit 0'
 mock modinfo "echo \"modinfo \$*\" >>${LOG}; exit 1"
@@ -366,6 +368,9 @@ tail -3 "${MOCK}/uninstall-failed.out" | sed 's/^/    | /'
 check "an uninstall whose package removal fails fails" test "${RC}" -ne 0
 check "  and keeps params and the server config" test -e /etc/amnezia/amneziawg/params -a -e /etc/amnezia/amneziawg/awg0.conf
 check "  and says so" grep -q "was kept, so the uninstall can be run again" "${MOCK}/uninstall-failed.out"
+# The config of a tunnel set up by hand next to the managed one (#158).
+printf '[Interface]\nPrivateKey = UPSTREAM\n' >/etc/amnezia/amneziawg/awg1.conf
+FOREIGN_SHA="$(sha256sum /etc/amnezia/amneziawg/awg1.conf)"
 : >"${LOG}"
 printf '6\ny\n' | bash "${INSTALLER}" >"${MOCK}/uninstall.out" 2>&1
 RC=$?
@@ -382,7 +387,13 @@ check "the unit is stopped and disabled before any package is removed" \
 check "the store is removed" test ! -e "${STORE}" -a ! -e /usr/local/lib/amneziawg-install
 check "the helpers are removed" test ! -e "${LIBEXEC}"
 check "the drop-in is removed" test ! -e "${DROPIN}" -a ! -d /etc/systemd/system/awg-quick@awg0.service.d
-check "the configuration, params and runtime file are removed" test ! -e /etc/amnezia/amneziawg
+check "the configuration, params and runtime file are removed" \
+	test ! -e /etc/amnezia/amneziawg/params -a ! -e /etc/amnezia/amneziawg/awg0.conf -a ! -e /etc/amnezia/amneziawg/awg0.boringtun
+check "  the hand-made tunnel's config is byte for byte as it was" \
+	test "$(sha256sum /etc/amnezia/amneziawg/awg1.conf 2>/dev/null)" = "${FOREIGN_SHA}"
+check "  and it is all that is left" test "$(ls -A /etc/amnezia/amneziawg)" = awg1.conf
+rm -f /etc/amnezia/amneziawg/awg1.conf
+rmdir /etc/amnezia/amneziawg
 check "the installer's load override is removed" test ! -e /etc/modprobe.d/amneziawg-install-boringtun.conf
 check "only amneziawg-tools is removed" grep -qx 'apt remove -y amneziawg-tools' "${LOG}"
 check "the kernel module package someone else installed stays" bash -c '! grep -q "amneziawg-dkms" "$1"' _ "${LOG}"

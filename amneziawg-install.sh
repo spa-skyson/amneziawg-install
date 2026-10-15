@@ -8630,6 +8630,34 @@ function askClientMtu() {
 	fi
 }
 
+# Whether a fresh installation may take NAME as its interface. It may not when
+# ${AMNEZIAWG_DIR}/NAME.conf exists, which the installation would overwrite,
+# or when a network link of that name exists: either is a tunnel set up by
+# hand, such as the upstream side of a two-hop server (issue #158). Prints why
+# when the name is taken.
+function awgInterfaceNameFree() { # <name>
+	if [[ -e "${AMNEZIAWG_DIR}/$1.conf" || -L "${AMNEZIAWG_DIR}/$1.conf" ]]; then
+		echo "${AMNEZIAWG_DIR}/$1.conf already exists"
+		return 1
+	fi
+	if ip link show dev "$1" >/dev/null 2>&1; then
+		echo "a network interface named $1 already exists"
+		return 1
+	fi
+}
+
+# The first of awg0 to awg99 that awgInterfaceNameFree allows.
+function firstFreeAwgInterfaceName() {
+	local N
+	for ((N = 0; N < 100; N++)); do
+		if awgInterfaceNameFree "awg${N}" >/dev/null; then
+			echo "awg${N}"
+			return 0
+		fi
+	done
+	return 1
+}
+
 function installQuestions() {
 	validateClientMtu || exit 1
 	# Fresh installs remain on AWG 2.0 regardless of caller environment. AWG 3.0
@@ -8686,7 +8714,19 @@ function installQuestions() {
 			exit 1
 		fi
 
-		SERVER_AWG_NIC=${SERVER_AWG_NIC:-awg0}
+		# A name the operator chose is used as given or refused below; the
+		# default is the first free awgN, so a hand-made awg0 is left alone.
+		local AWG_NIC_CONFLICT=""
+		if [[ -z "${SERVER_AWG_NIC:-}" ]]; then
+			if ! SERVER_AWG_NIC="$(firstFreeAwgInterfaceName)"; then
+				echo -e "${RED}ERROR: awg0 to awg99 are all in use. Set SERVER_AWG_NIC to a free interface name and rerun.${NC}"
+				exit 1
+			fi
+			if [[ "${SERVER_AWG_NIC}" != awg0 ]]; then
+				AWG_NIC_CONFLICT="$(awgInterfaceNameFree awg0)"
+				echo -e "${ORANGE}NOTE: awg0 is in use (${AWG_NIC_CONFLICT}); the server interface will be ${SERVER_AWG_NIC}. Set SERVER_AWG_NIC to choose another.${NC}"
+			fi
+		fi
 		SERVER_AWG_IPV4=${SERVER_AWG_IPV4:-10.66.66.1}
 		SERVER_AWG_IPV6=${SERVER_AWG_IPV6:-fd42:42:42::1}
 		SERVER_PORT=${SERVER_PORT:-$(shuf -i49152-65535 -n1)}
@@ -8726,6 +8766,11 @@ function installQuestions() {
 		fi
 		if ! [[ ${SERVER_AWG_NIC} =~ ^[a-zA-Z0-9_.-]+$ ]] || [[ ${#SERVER_AWG_NIC} -ge 16 ]]; then
 			echo -e "${RED}ERROR: SERVER_AWG_NIC is invalid (must be alphanumeric/._- and < 16 chars): ${SERVER_AWG_NIC}${NC}"
+			exit 1
+		fi
+		if ! AWG_NIC_CONFLICT="$(awgInterfaceNameFree "${SERVER_AWG_NIC}")"; then
+			echo -e "${RED}ERROR: SERVER_AWG_NIC=${SERVER_AWG_NIC} is in use: ${AWG_NIC_CONFLICT}. A fresh installation would overwrite it.${NC}"
+			echo -e "${ORANGE}Set SERVER_AWG_NIC to a free interface name, or leave it unset to use the first free awgN, and rerun.${NC}"
 			exit 1
 		fi
 		if ! [[ ${SERVER_AWG_IPV4} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; then
@@ -8832,8 +8877,18 @@ function installQuestions() {
 		read -rp "Public interface: " -e -i "${SERVER_NIC}" SERVER_PUB_NIC
 	done
 
-	until [[ ${SERVER_AWG_NIC} =~ ^[a-zA-Z0-9_.-]+$ && ${#SERVER_AWG_NIC} -lt 16 ]]; do
-		read -rp "AmneziaWG interface name: " -e -i awg0 SERVER_AWG_NIC
+	# Offer the first free awgN, and refuse a name whose config or link
+	# exists: the installation would overwrite a tunnel set up by hand.
+	local AWG_NIC_DEFAULT AWG_NIC_CONFLICT
+	AWG_NIC_DEFAULT="$(firstFreeAwgInterfaceName)" || AWG_NIC_DEFAULT=""
+	if [[ "${AWG_NIC_DEFAULT}" != awg0 ]]; then
+		echo -e "${ORANGE}awg0 is in use ($(awgInterfaceNameFree awg0)); choose a free interface name.${NC}"
+	fi
+	while true; do
+		read -rp "AmneziaWG interface name: " -e -i "${AWG_NIC_DEFAULT}" SERVER_AWG_NIC || exit 1
+		[[ ${SERVER_AWG_NIC} =~ ^[a-zA-Z0-9_.-]+$ && ${#SERVER_AWG_NIC} -lt 16 ]] || continue
+		AWG_NIC_CONFLICT="$(awgInterfaceNameFree "${SERVER_AWG_NIC}")" && break
+		echo -e "${ORANGE}${SERVER_AWG_NIC} is in use: ${AWG_NIC_CONFLICT}. The installation would overwrite it; choose another name.${NC}"
 	done
 
 	until [[ ${SERVER_AWG_IPV4} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
@@ -9340,6 +9395,12 @@ function writeAwgServerInstallState() {
 	chmod 700 "${AMNEZIAWG_DIR}"
 
 	SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
+	# installQuestions refused a name whose config existed; never overwrite
+	# one that has appeared since.
+	if [[ -e "${SERVER_AWG_CONF}" || -L "${SERVER_AWG_CONF}" ]]; then
+		echo -e "${RED}ERROR: ${SERVER_AWG_CONF} already exists; refusing to overwrite it.${NC}"
+		exit 1
+	fi
 
 	SERVER_PRIV_KEY=$(awg genkey)
 	SERVER_PUB_KEY=$(echo "${SERVER_PRIV_KEY}" | awg pubkey)
@@ -10539,10 +10600,80 @@ function boringtunServiceInactive() { # <interface>
 	esac
 }
 
+# Whether NAME, an entry of AMNEZIAWG_DIR, belongs to the installation of
+# INTERFACE. Only the exact names it writes count: params, its backup and
+# mktemp copies; the interface's config, its backup and the web helper's
+# temporary copy; its BoringTun runtime file and that file's temporary copy;
+# the hidden protocol and imitation copies of those three; the client configs;
+# retained protocol and imitation transactions; and the web helper's lock and
+# sync files. Any other name, such as params.conf or <interface>.conf.conf
+# (the configs of interfaces named params or <interface>.conf), is not.
+function awgConfigEntryOwned() { # <name> <interface>
+	[[ "$2" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+	# The interface name as a literal in the pattern, and mktemp's XXXXXX.
+	local N="${2//./[.]}" X='[A-Za-z0-9]{6}'
+	local OWNED="^(params([.]bak|[.]${X}|[.]tmp[.]${X})?|clients|[.]awg-(protocol|imitation)[.]${X}"
+	OWNED+="|${N}[.]conf([.]bak|[.]tmp[.]${X})?|${N}[.]boringtun|[.]${N}[.](boringtun[.]${X}|web[.]lock|sync[.]${X})"
+	OWNED+="|[.](params|${N}[.]conf|${N}[.]boringtun)[.](protocol|imitation)[.]${X})\$"
+	[[ "$1" =~ ${OWNED} ]]
+}
+
+# Remove the installation's own entries of AMNEZIAWG_DIR. Params and the
+# server config go last, the config first: until every other entry is gone
+# both stay, so that a failed removal leaves an installation the next run
+# loads and uninstalls again. Anything else there, such as the config of a
+# tunnel set up by hand (issue #158), stays, and so does the directory then.
+# Fails when an own entry could not be removed.
+function removeAwgInstallConfig() {
+	local ENTRY NAME LEFT="" KEPT=""
+	local -a OWN=()
+	[[ -e "${AMNEZIAWG_DIR}" || -L "${AMNEZIAWG_DIR}" ]] || return 0
+	if [[ ! "${SERVER_AWG_NIC:-}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+		echo -e "${RED}ERROR: SERVER_AWG_NIC is not a valid interface name; nothing was removed from ${AMNEZIAWG_DIR}.${NC}"
+		return 1
+	fi
+	while IFS= read -r -d '' ENTRY; do
+		NAME="${ENTRY##*/}"
+		if ! awgConfigEntryOwned "${NAME}" "${SERVER_AWG_NIC}"; then
+			KEPT+=" ${NAME}"
+		elif [[ "${NAME}" != params && "${NAME}" != "${SERVER_AWG_NIC}.conf" ]]; then
+			OWN+=("${ENTRY}")
+		fi
+	done < <(find "${AMNEZIAWG_DIR}" -mindepth 1 -maxdepth 1 -print0)
+	for ENTRY in "${OWN[@]}"; do
+		rm -rf -- "${ENTRY}"
+		[[ ! -e "${ENTRY}" && ! -L "${ENTRY}" ]] || LEFT+=" ${ENTRY##*/}"
+	done
+	if [[ -n "${LEFT}" ]]; then
+		echo -e "${RED}ERROR: could not remove${LEFT} from ${AMNEZIAWG_DIR}; params and ${SERVER_AWG_NIC}.conf were kept, so the uninstall can be run again.${NC}"
+		return 1
+	fi
+	ENTRY="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
+	rm -f -- "${ENTRY}"
+	if [[ -e "${ENTRY}" || -L "${ENTRY}" ]]; then
+		echo -e "${RED}ERROR: could not remove ${ENTRY}; params were kept, so the uninstall can be run again.${NC}"
+		return 1
+	fi
+	ENTRY="${AMNEZIAWG_DIR}/params"
+	rm -f -- "${ENTRY}"
+	if [[ -e "${ENTRY}" || -L "${ENTRY}" ]]; then
+		echo -e "${RED}ERROR: could not remove ${ENTRY}, the last file of this installation there; remove it by hand.${NC}"
+		return 1
+	fi
+	if [[ -n "${KEPT}" ]]; then
+		echo -e "${ORANGE}NOTE: ${AMNEZIAWG_DIR} also holds${KEPT}, which this installation did not create; it is left in place.${NC}"
+		return 0
+	fi
+	if ! rmdir -- "${AMNEZIAWG_DIR}"; then
+		echo -e "${RED}ERROR: ${AMNEZIAWG_DIR} could not be removed.${NC}"
+		return 1
+	fi
+}
+
 function uninstallAmneziaWG() {
 	echo ""
-	echo -e "\n${RED}WARNING: This will uninstall AmneziaWG and remove all the configuration files!${NC}"
-	echo -e "${ORANGE}Please backup the /etc/amnezia/amneziawg directory if you want to keep your configuration files.\n${NC}"
+	echo -e "\n${RED}WARNING: This will uninstall AmneziaWG and remove its configuration: params, ${SERVER_AWG_NIC}.conf and the client configs in ${AMNEZIAWG_DIR}!${NC}"
+	echo -e "${ORANGE}Please backup the ${AMNEZIAWG_DIR} directory if you want to keep your configuration files. Other files there are left in place.\n${NC}"
 	read -rp "Do you really want to remove AmneziaWG? [y/n]: " -e REMOVE
 	REMOVE=${REMOVE:-n}
 	if [[ $REMOVE == [yY] ]]; then
@@ -10629,7 +10760,7 @@ function uninstallAmneziaWG() {
 		# after its packages and repository entries are gone, so that until
 		# then a rerun finds params and uninstalls again.
 		if [[ "${AWG_BACKEND}" != "${AWG_BACKEND_BORINGTUN}" ]]; then
-			rm -rf "${AMNEZIAWG_DIR:?}"
+			removeAwgInstallConfig || UNINSTALL_FAILED=1
 		fi
 
 		# A BoringTun host installed only amneziawg-tools. Kernel module packages
@@ -10716,11 +10847,7 @@ function uninstallAmneziaWG() {
 			if [[ ${AWG_RUNNING} -eq 0 || ${UNINSTALL_FAILED} -ne 0 ]]; then
 				echo -e "${ORANGE}The configuration in ${AMNEZIAWG_DIR} was kept, so the uninstall can be run again.${NC}"
 			else
-				rm -rf "${AMNEZIAWG_DIR:?}"
-				if [[ -e "${AMNEZIAWG_DIR}" ]]; then
-					echo -e "${RED}ERROR: ${AMNEZIAWG_DIR} could not be removed.${NC}"
-					UNINSTALL_FAILED=1
-				fi
+				removeAwgInstallConfig || UNINSTALL_FAILED=1
 			fi
 		fi
 
@@ -10735,6 +10862,41 @@ function uninstallAmneziaWG() {
 		echo ""
 		echo "Removal aborted!"
 	fi
+}
+
+# The [Interface] PrivateKey of an AmneziaWG config as awg setconf reads it:
+# key names in any case, whitespace and comments ignored, the last line
+# winning. Prints nothing when there is none.
+function awgConfigInterfacePrivateKey() { # <config>
+	local LINE CLEAN IN_INTERFACE=0 KEY=""
+	while IFS= read -r LINE || [[ -n "${LINE}" ]]; do
+		CLEAN="${LINE%%#*}"
+		CLEAN="${CLEAN//[[:space:]]/}"
+		if [[ "${CLEAN}" == \[*\] ]]; then
+			IN_INTERFACE=0
+			[[ "${CLEAN,,}" == "[interface]" ]] && IN_INTERFACE=1
+		elif ((IN_INTERFACE)) && [[ "${CLEAN,,}" == privatekey=* ]]; then
+			KEY="${CLEAN#*=}"
+		fi
+	done <"$1" || return 1
+	printf '%s' "${KEY}"
+}
+
+# Whether SERVER_AWG_CONF is the server this installer manages: its
+# [Interface] PrivateKey is SERVER_PRIV_KEY from params. The installer manages
+# one interface, SERVER_AWG_NIC; a config of that name with another key is a
+# tunnel set up by hand, such as the upstream side of a two-hop server, and
+# adding clients to it breaks both (issue #158). No key is printed; the
+# reason also reaches the web panel's protocol diagnostics.
+function checkManagedServerConfig() {
+	local CONF_KEY
+	CONF_KEY="$(awgConfigInterfacePrivateKey "${SERVER_AWG_CONF}")" || CONF_KEY=""
+	if [[ -n "${CONF_KEY}" && "${CONF_KEY}" == "${SERVER_PRIV_KEY:-}" ]]; then
+		return 0
+	fi
+	reportAwgProtocolDiagnostic "ERROR: ${SERVER_AWG_CONF} is not the AmneziaWG server this installer manages: its [Interface] PrivateKey is not SERVER_PRIV_KEY from ${AMNEZIAWG_DIR}/params."
+	reportAwgProtocolDiagnostic "SERVER_AWG_NIC='${SERVER_AWG_NIC}' in params names another tunnel's config, which the installer refuses to change. Set SERVER_AWG_NIC to the managed server's interface, or restore its config, and rerun."
+	return 1
 }
 
 function validateParamsFile() {
@@ -10853,6 +11015,7 @@ function validateParamsFile() {
 		echo -e "${ORANGE}The params file exists but the config file is missing.${NC}" >&2
 		return 1
 	fi
+	checkManagedServerConfig || return 1
 
 	# Validate any persisted flag, but use the actual server interface Address as
 	# the authority for installed-server management. This keeps bash and the web

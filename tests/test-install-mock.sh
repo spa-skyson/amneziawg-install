@@ -269,13 +269,18 @@ case "$1" in
 esac
 '
 
-# Mock ip command
+# Mock ip command. An AmneziaWG link exists once its config does, or when a
+# test creates /tmp/awg-mock-links/<name>; a fresh install refuses either.
 create_mock "ip" '
 case "$1$2" in
 	-4addr)   echo "    inet 198.51.100.1/24 scope global eth0";;
 	-6addr)   echo "    inet6 2001:db8::1/64 scope global eth0";;
 	-4route)  echo "default via 198.51.100.254 dev eth0";;
 	-6route)  echo "default via 2001:db8::ffff dev eth0";;
+	linkshow)
+		[[ -e "/etc/amnezia/amneziawg/${4:-}.conf" || -e "/tmp/awg-mock-links/${4:-}" ]]
+		exit
+		;;
 	*)        exit 0;;
 esac
 '
@@ -370,6 +375,42 @@ if [[ "${OS_FAMILY}" == "debian" ]] && [[ ! -f /etc/apt/sources.list ]]; then
 	echo "deb http://archive.ubuntu.com/ubuntu/ focal main" > /etc/apt/sources.list
 fi
 
+# A fresh install never takes over a tunnel set up by hand (#158): with
+# SERVER_AWG_NIC naming an existing config or link it stops before installing
+# anything, and the config stays as it was.
+echo "--- Fresh install refuses an interface in use ---"
+PREINSTALL_FAILED=0
+mkdir -p /etc/amnezia/amneziawg /tmp/awg-mock-links
+printf '[Interface]\nPrivateKey = HANDMADE\n' > /etc/amnezia/amneziawg/awg0.conf
+NIC_GUARD_OUTPUT=$(AUTO_INSTALL=y SERVER_AWG_NIC=awg0 bash "${PROJECT_ROOT}/amneziawg-install.sh" 2>&1)
+NIC_GUARD_RC=$?
+if [[ ${NIC_GUARD_RC} -ne 0 ]] && \
+	grep -q 'SERVER_AWG_NIC=awg0 is in use: /etc/amnezia/amneziawg/awg0.conf already exists' <<<"${NIC_GUARD_OUTPUT}" && \
+	[[ "$(cat /etc/amnezia/amneziawg/awg0.conf)" == $'[Interface]\nPrivateKey = HANDMADE' ]] && \
+	[[ ! -e /etc/amnezia/amneziawg/params ]]; then
+	echo "OK: Fresh install refuses SERVER_AWG_NIC whose config exists and leaves it alone"
+else
+	echo "FAIL: Fresh install did not refuse an existing awg0.conf (rc=${NIC_GUARD_RC})"
+	echo "${NIC_GUARD_OUTPUT}" | tail -5
+	PREINSTALL_FAILED=$((PREINSTALL_FAILED + 1))
+fi
+rm -f /etc/amnezia/amneziawg/awg0.conf
+touch /tmp/awg-mock-links/awg0
+NIC_GUARD_OUTPUT=$(AUTO_INSTALL=y SERVER_AWG_NIC=awg0 bash "${PROJECT_ROOT}/amneziawg-install.sh" 2>&1)
+NIC_GUARD_RC=$?
+if [[ ${NIC_GUARD_RC} -ne 0 ]] && \
+	grep -q 'SERVER_AWG_NIC=awg0 is in use: a network interface named awg0 already exists' <<<"${NIC_GUARD_OUTPUT}" && \
+	[[ ! -e /etc/amnezia/amneziawg/awg0.conf && ! -e /etc/amnezia/amneziawg/params ]]; then
+	echo "OK: Fresh install refuses SERVER_AWG_NIC whose link exists"
+else
+	echo "FAIL: Fresh install did not refuse an existing awg0 link (rc=${NIC_GUARD_RC})"
+	echo "${NIC_GUARD_OUTPUT}" | tail -5
+	PREINSTALL_FAILED=$((PREINSTALL_FAILED + 1))
+fi
+rm -rf /tmp/awg-mock-links
+rmdir /etc/amnezia/amneziawg /etc/amnezia
+unset NIC_GUARD_OUTPUT NIC_GUARD_RC
+
 echo "Running installer with AUTO_INSTALL=y..."
 echo ""
 
@@ -387,7 +428,7 @@ INSTALL_RC=$?
 echo ""
 echo "=== Verifying installation (exit code: ${INSTALL_RC}) ==="
 
-FAILED=0
+FAILED=${PREINSTALL_FAILED}
 
 if [[ ${INSTALL_RC} -ne 0 ]]; then
 	echo "FAIL: Installer exited with non-zero code ${INSTALL_RC}"
@@ -1239,6 +1280,43 @@ else
 	FAILED=$((FAILED + 1))
 fi
 
+echo ""
+echo "--- Client management refuses a config that is not the managed server (#158) ---"
+# A two-hop server: params name awg0, but awg0.conf holds the upstream tunnel.
+# The CLI must neither add nor remove a peer there.
+MANAGED_CONF_BACKUP="$(mktemp)"
+cp -p "${SERVER_AWG_CONF}" "${MANAGED_CONF_BACKUP}"
+sed -i 's|^PrivateKey = .*|PrivateKey = VXBzdHJlYW1UdW5uZWxQcml2YXRlS2V5MTIzNDU2Nzg=|' "${SERVER_AWG_CONF}"
+MANAGED_CONF_HASH=$(sha256sum "${SERVER_AWG_CONF}" | awk '{print $1}')
+MANAGED_ADD_OUTPUT=$(bash "${PROJECT_ROOT}/amneziawg-install.sh" --add-client intruder 2>&1)
+MANAGED_ADD_RC=$?
+MANAGED_REMOVE_OUTPUT=$(bash "${PROJECT_ROOT}/amneziawg-install.sh" --remove-client client 2>&1)
+MANAGED_REMOVE_RC=$?
+if [[ ${MANAGED_ADD_RC} -ne 0 && ${MANAGED_REMOVE_RC} -ne 0 ]] && \
+	grep -q 'is not the AmneziaWG server this installer manages' <<<"${MANAGED_ADD_OUTPUT}" && \
+	grep -q 'is not the AmneziaWG server this installer manages' <<<"${MANAGED_REMOVE_OUTPUT}" && \
+	[[ "$(sha256sum "${SERVER_AWG_CONF}" | awk '{print $1}')" == "${MANAGED_CONF_HASH}" ]] && \
+	[[ -z "$(find /etc/amnezia /root /home -name 'awg0-client-intruder.conf' 2>/dev/null)" ]]; then
+	echo "OK: --add-client and --remove-client refuse a config whose key is not SERVER_PRIV_KEY"
+else
+	echo "FAIL: client management changed a config that is not the managed server (add rc=${MANAGED_ADD_RC}, remove rc=${MANAGED_REMOVE_RC})"
+	echo "${MANAGED_ADD_OUTPUT}" | tail -3
+	FAILED=$((FAILED + 1))
+fi
+cp -p "${MANAGED_CONF_BACKUP}" "${SERVER_AWG_CONF}"
+rm -f "${MANAGED_CONF_BACKUP}"
+if bash "${PROJECT_ROOT}/amneziawg-install.sh" --add-client keycheck >/dev/null 2>&1 && \
+	grep -qxF '### Client keycheck' "${SERVER_AWG_CONF}" && \
+	bash "${PROJECT_ROOT}/amneziawg-install.sh" --remove-client keycheck >/dev/null 2>&1 && \
+	! grep -qxF '### Client keycheck' "${SERVER_AWG_CONF}"; then
+	echo "OK: --add-client and --remove-client still manage the managed server"
+else
+	echo "FAIL: client management failed on the managed server"
+	FAILED=$((FAILED + 1))
+fi
+unset MANAGED_CONF_BACKUP MANAGED_CONF_HASH MANAGED_ADD_OUTPUT MANAGED_ADD_RC
+unset MANAGED_REMOVE_OUTPUT MANAGED_REMOVE_RC
+
 # ============================================================
 # Phase 2d: validateParamsFile – chmod failure handling
 # ============================================================
@@ -1290,7 +1368,7 @@ PARAMS_EOF
 	command chmod 700 "${VPFTEST_DIR}/params"
 
 	# Create the fake server config that validateParamsFile checks for.
-	touch "${VPFTEST_DIR}/awg0.conf"
+	printf '[Interface]\nPrivateKey = test_priv_key\n' > "${VPFTEST_DIR}/awg0.conf"
 
 	# Override AMNEZIAWG_DIR and chmod so that chmod on the params file applies
 	# the permission change but still returns non-zero with a stderr message,
@@ -1368,7 +1446,7 @@ PARAMS_EOF
 	command chmod 666 "${VPFTEST2_DIR}/params"
 
 	# Create the fake server config that validateParamsFile checks for.
-	touch "${VPFTEST2_DIR}/awg0.conf"
+	printf '[Interface]\nPrivateKey = test_priv_key\n' > "${VPFTEST2_DIR}/awg0.conf"
 
 	# Override AMNEZIAWG_DIR and chmod so that chmod on the params file fails.
 	AMNEZIAWG_DIR="${VPFTEST2_DIR}"
@@ -1435,7 +1513,7 @@ PARAMS_EOF
 	command chmod 644 "${VPFTEST_644_DIR}/params"
 
 	# Create the fake server config that validateParamsFile checks for.
-	touch "${VPFTEST_644_DIR}/awg0.conf"
+	printf '[Interface]\nPrivateKey = test_priv_key\n' > "${VPFTEST_644_DIR}/awg0.conf"
 
 	# Override AMNEZIAWG_DIR and chmod so that chmod on the params file fails
 	# without changing permissions — simulating a read-only filesystem.
@@ -1508,7 +1586,7 @@ PARAMS_EOF
 	# Mode 604: other-readable only (owner rw-, group ---, other r--), no write bits for group/other.
 	command chmod 604 "${VPFTEST_604_DIR}/params"
 
-	touch "${VPFTEST_604_DIR}/awg0.conf"
+	printf '[Interface]\nPrivateKey = test_priv_key\n' > "${VPFTEST_604_DIR}/awg0.conf"
 
 	AMNEZIAWG_DIR="${VPFTEST_604_DIR}"
 	chmod() {
@@ -1572,7 +1650,7 @@ PARAMS_EOF
 	# Mode 646: other-writable (owner rw-, group r--, other rw-) — must be fatal.
 	command chmod 646 "${VPFTEST_646_DIR}/params"
 
-	touch "${VPFTEST_646_DIR}/awg0.conf"
+	printf '[Interface]\nPrivateKey = test_priv_key\n' > "${VPFTEST_646_DIR}/awg0.conf"
 
 	AMNEZIAWG_DIR="${VPFTEST_646_DIR}"
 	chmod() {
@@ -2443,8 +2521,10 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 	rm -f "${HELPER_TEST_CONF}" "${HELPER_TEST_LOCK}" "${HELPER_BAD_KEY_CONF}" "${SHOW_ACTUAL}" \
 		"${PARAMS_ACTUAL}" "${READ_ACTUAL}" /tmp/awg-syncconf-stdin \
 		/tmp/awg-quick-strip-output
-	printf '[Interface]\nPrivateKey = SERVER_PRIVATE_SECRET\nAddress = 10.66.66.1/24, fd42:0042:0042:0000::1/64\nPostUp = echo trusted\n\n### Client existing\n[Peer]\nPublicKey = %s\nPresharedKey = SERVER_PEER_PSK_SECRET\nAllowedIPs = 10.66.66.41/32\n' \
-		"${SECOND_HELPER_KEY}" > "${HELPER_TEST_CONF}"
+	# The helper changes only a config that holds the installer's server key.
+	HELPER_SERVER_PRIV_KEY=$(sed -n "s/^SERVER_PRIV_KEY='\(.*\)'\$/\1/p" /etc/amnezia/amneziawg/params)
+	printf '[Interface]\nPrivateKey = %s\nAddress = 10.66.66.1/24, fd42:0042:0042:0000::1/64\nPostUp = echo trusted\n\n### Client existing\n[Peer]\nPublicKey = %s\nPresharedKey = SERVER_PEER_PSK_SECRET\nAllowedIPs = 10.66.66.41/32\n' \
+		"${HELPER_SERVER_PRIV_KEY}" "${SECOND_HELPER_KEY}" > "${HELPER_TEST_CONF}"
 	chmod 0600 "${HELPER_TEST_CONF}"
 	chown root:root "${HELPER_TEST_CONF}"
 	printf '[Interface]\nPrivateKey = SYNC_PRIVATE_SECRET\n\n[Peer]\nPublicKey = %s\nPresharedKey = DISABLED_PSK_SECRET\nAllowedIPs = 10.66.66.42/32\n\n[Peer]\nPublicKey = %s\nPresharedKey = ENABLED_PSK_SECRET\nAllowedIPs = 10.66.66.43/32\n' \
@@ -2628,7 +2708,8 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 
 	if grep -Eq 'PRIVATE_KEY|PEER_PSK_SECRET' "${SHOW_ACTUAL}" || \
 		grep -q '^SERVER_PRIV_KEY=' "${PARAMS_ACTUAL}" || \
-		grep -Eq 'PrivateKey|PresharedKey|PostUp|SERVER_PRIVATE_SECRET|SERVER_PEER_PSK_SECRET' "${READ_ACTUAL}"; then
+		grep -Eq 'PrivateKey|PresharedKey|PostUp|SERVER_PEER_PSK_SECRET' "${READ_ACTUAL}" || \
+		grep -Fq "${HELPER_SERVER_PRIV_KEY}" "${READ_ACTUAL}"; then
 		echo "FAIL: Privileged helper exposed a private key, pre-shared key, or privileged directive"
 		FAILED=$((FAILED + 1))
 	else
@@ -2648,6 +2729,59 @@ if [[ -x "${PRIVILEGED_HELPER}" ]]; then
 		echo "FAIL: Privileged helper failed semantic peer append"
 		FAILED=$((FAILED + 1))
 	fi
+
+	# A config with another [Interface] key is someone else's tunnel (#158):
+	# the helper neither appends nor removes a peer there, and says why.
+	HELPER_FOREIGN_INTERFACE="helperforeign"
+	HELPER_FOREIGN_CONF="/etc/amnezia/amneziawg/${HELPER_FOREIGN_INTERFACE}.conf"
+	printf '[Interface]\nPrivateKey = UPSTREAM_PRIVATE_SECRET\nAddress = 10.0.0.2/32\n\n### Client existing\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = 10.66.66.41/32\n' \
+		"${SECOND_HELPER_KEY}" "${VALID_HELPER_PSK}" > "${HELPER_FOREIGN_CONF}"
+	chmod 0600 "${HELPER_FOREIGN_CONF}"
+	chown root:root "${HELPER_FOREIGN_CONF}"
+	HELPER_FOREIGN_HASH=$(sha256sum "${HELPER_FOREIGN_CONF}" | awk '{print $1}')
+	HELPER_FOREIGN_FAILED=0
+	HELPER_FOREIGN_ERR=$(printf 'PublicKey = %s\nPresharedKey = %s\nAllowedIPs = 10.66.66.45/32\n' \
+			"${VALID_HELPER_KEY}" "${VALID_HELPER_PSK}" \
+		| "${PRIVILEGED_HELPER}" append-peer "${HELPER_FOREIGN_INTERFACE}" carol 2>&1 >/dev/null) && \
+		HELPER_FOREIGN_FAILED=1
+	grep -q "${HELPER_FOREIGN_CONF} is not the installer-managed server" <<<"${HELPER_FOREIGN_ERR}" || \
+		HELPER_FOREIGN_FAILED=1
+	"${PRIVILEGED_HELPER}" remove-client "${HELPER_FOREIGN_INTERFACE}" existing \
+		>/dev/null 2>&1 && HELPER_FOREIGN_FAILED=1
+	"${PRIVILEGED_HELPER}" remove-client-if-key "${HELPER_FOREIGN_INTERFACE}" existing \
+		"${SECOND_HELPER_KEY}" >/dev/null 2>&1 && HELPER_FOREIGN_FAILED=1
+	# Nor does it change that tunnel live: disabling a peer there would cut
+	# the upstream connection.
+	: > /tmp/awg-calls.log
+	: > /tmp/awg-quick-calls.log
+	"${PRIVILEGED_HELPER}" remove-peer "${HELPER_FOREIGN_INTERFACE}" "${SECOND_HELPER_KEY}" \
+		>/dev/null 2>&1 && HELPER_FOREIGN_FAILED=1
+	printf '%s\n' "${SECOND_HELPER_KEY}" | "${PRIVILEGED_HELPER}" reconcile-interface "${HELPER_FOREIGN_INTERFACE}" \
+		>/dev/null 2>&1 && HELPER_FOREIGN_FAILED=1
+	if grep -q "${HELPER_FOREIGN_INTERFACE}" /tmp/awg-calls.log /tmp/awg-quick-calls.log; then
+		HELPER_FOREIGN_FAILED=1
+	fi
+	if [[ "${HELPER_FOREIGN_FAILED}" -eq 0 ]] && \
+		[[ "$(sha256sum "${HELPER_FOREIGN_CONF}" | awk '{print $1}')" == "${HELPER_FOREIGN_HASH}" ]] && \
+		! grep -Fq 'UPSTREAM_PRIVATE_SECRET' <<<"${HELPER_FOREIGN_ERR}"; then
+		echo "OK: Privileged helper refuses to change, in its config or live, an interface that is not the managed server"
+	else
+		echo "FAIL: Privileged helper changed an interface that is not the managed server"
+		FAILED=$((FAILED + 1))
+	fi
+	# The managed interface still takes both live operations.
+	: > /tmp/awg-calls.log
+	if "${PRIVILEGED_HELPER}" remove-peer awg0 "${SECOND_HELPER_KEY}" >/dev/null 2>&1 && \
+		grep -qx "set awg0 peer ${SECOND_HELPER_KEY} remove" /tmp/awg-calls.log && \
+		printf '' | "${PRIVILEGED_HELPER}" reconcile-interface awg0 >/dev/null 2>&1 && \
+		grep -q '^syncconf awg0 ' /tmp/awg-calls.log; then
+		echo "OK: Privileged helper still removes peers from and reconciles the managed interface"
+	else
+		echo "FAIL: Privileged helper refused a live operation on the managed interface"
+		FAILED=$((FAILED + 1))
+	fi
+	rm -f "${HELPER_FOREIGN_CONF}" "/etc/amnezia/amneziawg/.${HELPER_FOREIGN_INTERFACE}.web.lock"
+	unset HELPER_FOREIGN_INTERFACE HELPER_FOREIGN_CONF HELPER_FOREIGN_HASH HELPER_FOREIGN_FAILED HELPER_FOREIGN_ERR
 
 	HELPER_REJECTION_FAILED=0
 	"${PRIVILEGED_HELPER}" show-all extra >/dev/null 2>&1 && HELPER_REJECTION_FAILED=1
